@@ -76,6 +76,53 @@ impl CostMatrixDataSource for TerrainCostSource {
     }
 }
 
+/// A [`CostMatrixDataSource`] over a `SimTerrain` PLUS current creep occupancy — the faithful
+/// analogue of rover's live `ScreepsCostMatrixDataSource`, which marks every friendly creep's tile
+/// `u8::MAX` in the `friendly_creeps` matrix. rover's default options path *through* friendlies
+/// (`friendly_creeps: false`) and flip this matrix on only as **stuck-escalation** — so a parked
+/// creep is routed around after a few blocked ticks, instead of being invisible forever. The
+/// multi-creep drivers ([`crate::crowd`], [`crate::haul`]) MUST use this (rebuilt per tick);
+/// omitting occupancy violates rover's usage contract and manufactures permanent livelock (the
+/// failed-move sentinel's first catch, ADR 0033 §D5.4 note).
+pub struct WorldCostSource {
+    terrain: TerrainCostSource,
+    friendly: Vec<(u8, u8)>,
+}
+
+impl WorldCostSource {
+    /// Snapshot the terrain + every living creep's tile (all sim creeps are "friendly" — the whole
+    /// fleet is rover-controlled).
+    pub fn new(terrain: &SimTerrain, world: &screeps_sim_core::MovementState) -> Self {
+        WorldCostSource {
+            terrain: TerrainCostSource::new(terrain),
+            friendly: world
+                .living_creeps()
+                .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
+                .collect(),
+        }
+    }
+}
+
+impl CostMatrixDataSource for WorldCostSource {
+    fn get_structure_costs(&self, room: RoomName) -> Option<StuctureCostMatrixCache> {
+        self.terrain.get_structure_costs(room)
+    }
+    fn get_construction_site_costs(&self, room: RoomName) -> Option<ConstructionSiteCostMatrixCache> {
+        self.terrain.get_construction_site_costs(room)
+    }
+    fn get_creep_costs(&self, _room: RoomName) -> Option<CreepCostMatrixCache> {
+        let mut friendly_creeps = LinearCostMatrix::new();
+        for &(x, y) in &self.friendly {
+            friendly_creeps.set(x, y, u8::MAX); // screeps_impl.rs:252 verbatim
+        }
+        Some(CreepCostMatrixCache {
+            friendly_creeps,
+            hostile_creeps: LinearCostMatrix::new(),
+            source_keeper_agro: LinearCostMatrix::new(),
+        })
+    }
+}
+
 /// Build the `LocalCostMatrix` rover's pathfinder reads for `room` — via rover's own
 /// `CostMatrixSystem`, so rover-eval never hand-rolls a matrix beyond the pricing above. The default
 /// `CostMatrixOptions` price roads at 1 (`road_cost`), matching `FATIGUE_RATE_ROAD`.

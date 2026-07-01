@@ -10,13 +10,18 @@
 //! Host-only; it reuses the `screeps-sim-core` kernel (no re-ported physics) and rover's own
 //! `LocalPathfinder` + `room_grid_dijkstra` (no one-off search algorithms — pricing policy only).
 
+pub mod base_traffic;
 pub mod cost;
 pub mod crowd;
+pub mod haul;
 pub mod metrics;
 pub mod oracle;
 pub mod pathing;
 pub mod scenario;
+pub mod stats;
 pub mod traverse;
+pub mod tuning;
+pub mod value;
 
 #[cfg(test)]
 mod kernel_reuse_smoke {

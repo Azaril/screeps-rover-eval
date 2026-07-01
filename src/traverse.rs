@@ -63,34 +63,56 @@ pub fn traverse(
     route: &[Position],
     tick_cap: u32,
 ) -> Traversal {
+    traverse_cycle(terrain, body, from, &[(carry_used, route)], tick_cap)
+}
+
+/// Walk a creep through consecutive `legs` — each `(carry_used, route)` — in ONE continuous
+/// simulation: fatigue carries across leg boundaries (a loaded hauler that arrives at the sink
+/// tired pays that fatigue before heading back), and `carry_used` switches at each leg start
+/// (instant load/unload). This is the honest multi-leg baseline for round-trip metrics; summing
+/// per-leg [`traverse`] calls would silently reset fatigue at every turn and overstate the optimum.
+pub fn traverse_cycle(
+    terrain: &screeps_sim_core::SimTerrain,
+    body: SimBody,
+    from: Position,
+    legs: &[(u32, &[Position])],
+    tick_cap: u32,
+) -> Traversal {
     let mut world = MovementState {
         terrain: terrain.clone(),
-        creeps: vec![SimCreep { id: 1, owner: 0, pos: from, body, fatigue: 0, carry_used }],
+        creeps: vec![SimCreep { id: 1, owner: 0, pos: from, body, fatigue: 0, carry_used: 0 }],
         ..Default::default()
     };
-    let mut t = Traversal { reached: route.is_empty(), ..Default::default() };
-    let mut i = 0usize;
-    while i < route.len() && t.ticks < tick_cap {
-        let before = world.creeps[0].pos;
-        let fatigued = world.creeps[0].fatigue > 0;
-        let mut intents = MoveIntents::new();
-        if let Some(dir) = direction_between(before, route[i]) {
-            intents.set_move(1, dir);
-        }
-        resolve_movement(&mut world, &intents);
-        t.ticks += 1;
-        let after = world.creeps[0].pos;
-        if after != before {
-            t.moves += 1;
-            if after == route[i] {
-                i += 1;
+    let mut t = Traversal { reached: legs.iter().all(|(_, r)| r.is_empty()), ..Default::default() };
+    for &(carry_used, route) in legs {
+        world.creeps[0].carry_used = carry_used;
+        let mut i = 0usize;
+        while i < route.len() && t.ticks < tick_cap {
+            let before = world.creeps[0].pos;
+            let fatigued = world.creeps[0].fatigue > 0;
+            let mut intents = MoveIntents::new();
+            if let Some(dir) = direction_between(before, route[i]) {
+                intents.set_move(1, dir);
             }
-        } else if fatigued {
-            t.idle_fatigued += 1;
-        } else {
-            t.idle_free += 1;
+            resolve_movement(&mut world, &intents);
+            t.ticks += 1;
+            let after = world.creeps[0].pos;
+            if after != before {
+                t.moves += 1;
+                if after == route[i] {
+                    i += 1;
+                }
+            } else if fatigued {
+                t.idle_fatigued += 1;
+            } else {
+                t.idle_free += 1;
+            }
+        }
+        if i < route.len() {
+            t.reached = false;
+            return t; // hit the cap mid-leg
         }
     }
-    t.reached = i >= route.len();
+    t.reached = true;
     t
 }

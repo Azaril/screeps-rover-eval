@@ -8,8 +8,9 @@
 //! creep that sits still with **zero fatigue** and an unmet goal was blocked by *traffic* (lost a tile
 //! contest / held by the resolver), not by its body. Single-creep worlds can't produce that.
 
-use crate::cost::TerrainCostSource;
+use crate::cost::WorldCostSource;
 use screeps::Position;
+use screeps_sim_core::movement::step;
 use screeps_sim_core::{
     resolve_moves_via_system, MoveIntents, MovementState, SimBody, SimCreep, SimMoveCache,
     SimMoveRequest, SimTerrain,
@@ -54,8 +55,133 @@ pub struct CrowdReport {
     pub traffic_idle: u32,
     /// Creep-ticks a travelling creep could not move because it was fatigued (body-forced).
     pub fatigue_idle: u32,
+    /// The issued-intent vs executed-move reconciliation (the failed-move sentinel).
+    pub audit: IntentAudit,
     /// No creep moved for [`DEADLOCK_TICKS`] consecutive ticks while some goal was unmet.
     pub deadlocked: bool,
+}
+
+/// **Intent spent, no action taken** — the reconciliation of every `Direction` rover issued against
+/// what the engine actually executed. The algorithmic-failure signal: every sim creep is
+/// rover-controlled (no uncontrollable NPCs, unlike live), so a failed move means rover's issued
+/// move-set was not self-consistent — unanticipated coordinated movement. The offline analogue of
+/// the live G-13 wasted-move canary; in live each failure also burns intent CPU. Shared by every
+/// multi-creep driver ([`run_crowd`], the haul benchmark).
+#[derive(Clone, Debug, Default)]
+pub struct IntentAudit {
+    /// Move intents rover issued (a `Direction` per creep per tick).
+    pub intents_issued: u32,
+    /// Issued intents the engine rejected (Σ of the three classes below).
+    pub failed_moves: u32,
+    /// Failed moves issued for a creep that was FATIGUED at tick start (the engine's `canMove`
+    /// ignores it) — rover has the fatigue data, so these are avoidable wasted intents.
+    pub failed_fatigued: u32,
+    /// Failed moves issued INTO a wall or off the room edge — an outright pathing bug.
+    pub failed_wall: u32,
+    /// Failed moves whose blocking chain terminates at a **parked** creep — one that reached its
+    /// goal and left the request set, making it invisible to rover's resolver AND to its optimistic
+    /// first-path (`friendly_creeps: false` until `ticks_immobile ≥ 2` escalates). This is rover's
+    /// *designed, live-faithful* optimism cost: bounded per blocking event (≈ the stuck threshold),
+    /// self-healing via the friendly-avoid repath. Root-caused 2026-07-01 (head-on tube trace);
+    /// regression-tracked, never silently folded into the strict class below.
+    pub failed_into_parked: u32,
+    /// Failed moves the resolver had FULL knowledge to avoid: contention lost to, or chain-blocked
+    /// behind, an **active** (requested) creep. The resolver plans exactly these creeps as one
+    /// move-set, so any rejection here is an unexplained resolver↔engine model divergence —
+    /// **gated `== 0` everywhere**; a nonzero value means the sim (or rover) is wrong and must be
+    /// investigated, not tolerated.
+    pub failed_coordination: u32,
+}
+
+impl IntentAudit {
+    /// Reconcile one tick's issued `dirs` against the executed `moved` set, classifying each
+    /// rejected intent. `before`/`fatigued` are the tick-start snapshots indexed by `id − 1`;
+    /// `requested` is the set of creep ids the driver put in this tick's `MovementData` — the
+    /// creeps the resolver KNEW about. A rejection is walked down its blocking chain (a rejected
+    /// occupant's own destination, transitively): a chain ending at an unrequested (parked) creep
+    /// is the known optimism cost (`failed_into_parked`); anything else is `failed_coordination`.
+    pub(crate) fn reconcile(
+        &mut self,
+        world: &MovementState,
+        dirs: &std::collections::HashMap<u32, screeps::Direction>,
+        tick_report: &screeps_sim_core::MovementReport,
+        before: &[Position],
+        fatigued: &[bool],
+        requested: &std::collections::HashSet<u32>,
+    ) {
+        self.intents_issued += dirs.len() as u32;
+        // Tick-start occupancy: tile → creep id (living creeps only; one per tile in a valid world).
+        let occupant: std::collections::HashMap<Position, u32> = world
+            .creeps
+            .iter()
+            .filter(|c| c.is_alive())
+            .map(|c| (before[(c.id - 1) as usize], c.id))
+            .collect();
+
+        for (&id, &dir) in dirs {
+            if tick_report.moved.contains_key(&id) {
+                continue;
+            }
+            self.failed_moves += 1;
+            let i = (id - 1) as usize;
+            if fatigued[i] {
+                self.failed_fatigued += 1;
+                continue;
+            }
+            let mut dest = match step(before[i], dir) {
+                None => {
+                    self.failed_wall += 1; // off the room edge
+                    continue;
+                }
+                Some(d) => d,
+            };
+            if world.terrain_for(dest.room_name()).is_wall(dest.x().u8(), dest.y().u8()) {
+                self.failed_wall += 1;
+                continue;
+            }
+            // Walk the blocking chain: while the blocker is an ACTIVE creep that was itself
+            // rejected, follow ITS destination. Terminate at a parked (unrequested) creep →
+            // into_parked; at anything else (active stayer, contention loss, cycle) → coordination.
+            let mut visited = std::collections::HashSet::new();
+            let class = loop {
+                let Some(&occ_id) = occupant.get(&dest) else {
+                    // Empty tile and still rejected → a pure contention loss to another mover.
+                    break "coordination";
+                };
+                if !requested.contains(&occ_id) {
+                    break "parked";
+                }
+                if tick_report.moved.contains_key(&occ_id) {
+                    break "coordination"; // the blocker moved — our creep lost the vacated tile
+                }
+                let Some(&occ_dir) = dirs.get(&occ_id) else {
+                    break "coordination"; // active blocker the resolver chose to hold
+                };
+                if !visited.insert(occ_id) {
+                    break "coordination"; // a blocking cycle among active creeps
+                }
+                match step(before[(occ_id - 1) as usize], occ_dir) {
+                    Some(next) => dest = next, // follow the chain to what blocked the blocker
+                    None => break "coordination",
+                }
+            };
+            if class == "parked" {
+                self.failed_into_parked += 1;
+            } else {
+                self.failed_coordination += 1;
+            }
+        }
+    }
+
+    /// Failed-move rate: the share of issued move intents the engine rejected. The hard sentinel —
+    /// `0` when rover's issued move-set is fully self-consistent under the engine's contention
+    /// rules; `> 0` is the failure class live NPC interference would only worsen.
+    pub fn failed_move_rate(&self) -> f64 {
+        if self.intents_issued == 0 {
+            return 0.0;
+        }
+        self.failed_moves as f64 / self.intents_issued as f64
+    }
 }
 
 /// Drive `creeps` to their goals through rover's `MovementSystem` + resolver, one tick at a time, over
@@ -94,7 +220,8 @@ pub fn run_crowd(terrain: &SimTerrain, creeps: &[CrowdCreep], tick_cap: u32) -> 
             .filter(|&i| !within(world.creeps[i].pos, i))
             .map(|i| SimMoveRequest::move_to(world.creeps[i].id, goals[i].0, goals[i].1))
             .collect();
-        let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, TerrainCostSource::new(terrain));
+        let requested: std::collections::HashSet<u32> = reqs.iter().map(|r| r.creep).collect();
+        let dirs = resolve_moves_via_system(&world, &reqs, &mut cache, WorldCostSource::new(terrain, &world));
 
         let before: Vec<Position> = world.creeps.iter().map(|c| c.pos).collect();
         let fatigued: Vec<bool> = world.creeps.iter().map(|c| c.fatigue > 0).collect();
@@ -102,8 +229,9 @@ pub fn run_crowd(terrain: &SimTerrain, creeps: &[CrowdCreep], tick_cap: u32) -> 
         for (&id, &d) in &dirs {
             intents.set_move(id, d);
         }
-        resolve_movement(&mut world, &intents);
+        let tick_report = resolve_movement(&mut world, &intents);
         report.ticks = t + 1;
+        report.audit.reconcile(&world, &dirs, &tick_report, &before, &fatigued, &requested);
 
         let mut moved_any = false;
         for i in 0..n {
@@ -157,6 +285,7 @@ pub fn crowd_fatigue_util(r: &CrowdReport) -> f64 {
     1.0 - congestion(r)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +313,7 @@ mod tests {
         assert!(!r.deadlocked);
         assert!(congestion(&r) < 1e-9, "parallel lanes never contend, got congestion {}", congestion(&r));
         assert!((crowd_fatigue_util(&r) - 1.0).abs() < 1e-9);
+        assert_eq!(r.audit.failed_moves, 0, "free flow must waste zero intents ({} issued)", r.audit.intents_issued);
     }
 
     /// A wall spanning the room with a single one-tile gap: every creep must funnel through it, so the
@@ -211,6 +341,13 @@ mod tests {
         let spread = arr.iter().max().unwrap() - arr.iter().min().unwrap();
         assert!(spread >= 3, "4 creeps through one gap must serialise (arrival spread ≥ 3), got {arr:?}");
         assert!((0.0..=1.0).contains(&congestion(&r)), "congestion is a valid fraction");
+        // Measured baseline 2026-07-01: 52 intents, 0 failed — the resolver pre-resolves contention
+        // and only issues self-consistent move-sets. Hard gate: a failed move here is a regression.
+        assert_eq!(
+            r.audit.failed_moves, 0,
+            "pinch: rover wasted {} of {} intents (coordination={})",
+            r.audit.failed_moves, r.audit.intents_issued, r.audit.failed_coordination
+        );
     }
 
     /// Two creeps head-on in a one-tile-wide tube must swap past each other (rover `allow_swap`), and
@@ -227,7 +364,58 @@ mod tests {
             CrowdCreep::new(balanced(), pos(14, 25), pos(10, 25), 0),
         ];
         let r = run_crowd(&terrain, &creeps, 100);
-        assert!(r.all_arrived, "head-on creeps swap past each other; arrivals={:?}", r.arrivals);
+        assert!(r.all_arrived, "head-on creeps pass each other; arrivals={:?}", r.arrivals);
         assert!(!r.deadlocked);
+        // ROOT-CAUSED baseline (tick trace, 2026-07-01): rover does NOT swap — it retreats one creep
+        // out of the tube and re-routes it around while the other marches through. The winner then
+        // PARKS on its goal (the tube mouth), leaves the request set. Under the pre-tuning default
+        // (`reuse_path_length: 5`) the re-routed creep re-optimized back onto the blocked short path
+        // and burned exactly `ticks_immobile ≥ 2` failed intents at the parked blocker; with the
+        // tournament-tuned commitment default (20) it sticks to its detour and wastes NOTHING.
+        assert_eq!(
+            r.audit.failed_coordination, 0,
+            "any active-creep rejection is an unexplained resolver↔engine divergence"
+        );
+        assert_eq!(
+            r.audit.failed_into_parked, 0,
+            "path commitment avoids the parked mouth blocker entirely: {} of {} intents",
+            r.audit.failed_into_parked, r.audit.intents_issued
+        );
+    }
+
+    /// The nastiest coordination pattern: 8 creeps on a ring, each targeting the diametrically
+    /// opposite point, so every shortest path crosses the same centre tiles at the same time. rover
+    /// must still emit only self-consistent move-sets — **zero failed moves** ("intent spent, no
+    /// action" = the algorithmic-failure sentinel; every creep here is ours, no NPC excuse).
+    #[test]
+    fn crossing_swarm_wastes_no_intents() {
+        let terrain = SimTerrain::default();
+        let ring: [(u8, u8); 8] = [
+            (25, 20), (28, 21), (30, 25), (28, 29), (25, 30), (22, 29), (20, 25), (22, 21),
+        ];
+        let creeps: Vec<CrowdCreep> = ring
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| {
+                let (gx, gy) = ring[(i + 4) % 8]; // the opposite point on the ring
+                CrowdCreep::new(balanced(), pos(x, y), pos(gx, gy), 0)
+            })
+            .collect();
+        let r = run_crowd(&terrain, &creeps, 200);
+        assert!(r.all_arrived, "all 8 cross to the opposite side; arrivals={:?}", r.arrivals);
+        assert!(!r.deadlocked);
+        assert_eq!(
+            r.audit.failed_coordination, 0,
+            "crossing swarm: {} unexplained rejections of {} intents (fatigued={} wall={} parked={})",
+            r.audit.failed_coordination, r.audit.intents_issued, r.audit.failed_fatigued,
+            r.audit.failed_wall, r.audit.failed_into_parked
+        );
+        // Early finishers park ON the ring where late paths cross — the same root-caused parked-
+        // blocker mechanism as the head-on tube; bounded per event, not linear.
+        assert!(
+            r.audit.failed_into_parked <= 4,
+            "parked-blocker optimism stays bounded: {} of {}",
+            r.audit.failed_into_parked, r.audit.intents_issued
+        );
     }
 }

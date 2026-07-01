@@ -15,3 +15,15 @@ screeps-game-api = "0.23"
 screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core", features = ["rover"] }
 # The pathfinder + Dijkstra oracle UNDER TEST (pure/offline build — no `screeps` feature).
 screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }
+# Real-terrain machinery REUSE (ADR 0033 §D2/§D6): combat-eval's committed real mmo:shard3 room
+# fixtures (`terrain_import::fixtures`) + the verified column-major terrain decoder. The C-family
+# base-traffic scenarios plan foreman bases over these fixtures via the `capture_layout` bin.
+screeps-combat-eval = { git = "https://github.com/Azaril/screeps-combat-eval" }
+# The foreman room planner (offline, SLOW — ~4–60s/room) — run ONCE by the `capture_layout` bin to
+# plan realistic bases (incl. the roads/containers/storage combat-eval's `CapturedBase` drops) into
+# the committed `resources/captured-layouts.json` cache; never planned at test time.
+screeps-foreman = { git = "https://github.com/Azaril/screeps-foreman" }
+screeps-common = { git = "https://github.com/Azaril/screeps-common" }
+# The committed layout cache (same committed-fixture pattern as combat-eval, ADR 0025 §12 Stage 3a).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
