@@ -14,6 +14,8 @@ pub mod cost;
 pub mod metrics;
 pub mod oracle;
 pub mod pathing;
+pub mod scenario;
+pub mod traverse;
 
 #[cfg(test)]
 mod kernel_reuse_smoke {
@@ -49,6 +51,7 @@ mod kernel_reuse_smoke {
                 pos: pos(25, 25),
                 body,
                 fatigue: 0,
+                carry_used: 0,
             }],
             ..Default::default()
         };
