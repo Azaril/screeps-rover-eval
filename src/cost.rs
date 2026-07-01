@@ -22,11 +22,23 @@ pub fn fatigue_rate(terrain: &SimTerrain, x: u8, y: u8) -> u32 {
 
 /// A [`CostMatrixDataSource`] over a `SimTerrain`: walls impassable, swamps at their fatigue cost,
 /// roads at cost 1 (overriding an underlying swamp). Owns its data so it is `'static` for rover's
-/// `CostMatrixSystem`.
-struct TerrainCostSource {
+/// `CostMatrixSystem`. Priced by terrain only — no creep costs, so multi-creep contention is left to
+/// the `MovementSystem` resolver (what the Tier-B crowd sim measures), not baked into the field.
+pub struct TerrainCostSource {
     walls: Vec<(u8, u8)>,
     swamps: Vec<(u8, u8)>,
     roads: Vec<(u8, u8)>,
+}
+
+impl TerrainCostSource {
+    /// Snapshot a `SimTerrain` into an owned, `'static` cost source for rover's `CostMatrixSystem`.
+    pub fn new(terrain: &SimTerrain) -> Self {
+        TerrainCostSource {
+            walls: terrain.walls.iter().copied().collect(),
+            swamps: terrain.swamps.iter().copied().collect(),
+            roads: terrain.roads.iter().copied().collect(),
+        }
+    }
 }
 
 impl CostMatrixDataSource for TerrainCostSource {
@@ -68,11 +80,7 @@ impl CostMatrixDataSource for TerrainCostSource {
 /// `CostMatrixSystem`, so rover-eval never hand-rolls a matrix beyond the pricing above. The default
 /// `CostMatrixOptions` price roads at 1 (`road_cost`), matching `FATIGUE_RATE_ROAD`.
 pub fn build_cost_matrix(terrain: &SimTerrain, room: RoomName) -> Option<LocalCostMatrix> {
-    let source = TerrainCostSource {
-        walls: terrain.walls.iter().copied().collect(),
-        swamps: terrain.swamps.iter().copied().collect(),
-        roads: terrain.roads.iter().copied().collect(),
-    };
+    let source = TerrainCostSource::new(terrain);
     let mut cache = CostMatrixCache::default();
     let mut system = CostMatrixSystem::new(&mut cache, Box::new(source));
     system

@@ -10,8 +10,8 @@ description = "Offline simulator + benchmark for screeps-rover (ADR 0033): drive
 
 [dependencies]
 screeps-game-api = "0.23"
-# The shared movement kernel (world + terrain + body + the mover). No `rover` feature yet — Tier A
-# drives rover's LocalPathfinder directly; the offline MovementSystem driver (Tier B) arrives with M1.
-screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core" }
+# The shared movement kernel (world + terrain + body + the mover). The `rover` feature pulls the
+# offline `MovementSystem` driver (`resolve_moves_via_system`) that the Tier-B crowd sim drives.
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core", features = ["rover"] }
 # The pathfinder + Dijkstra oracle UNDER TEST (pure/offline build — no `screeps` feature).
 screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }

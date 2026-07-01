@@ -11,6 +11,7 @@
 //! `LocalPathfinder` + `room_grid_dijkstra` (no one-off search algorithms — pricing policy only).
 
 pub mod cost;
+pub mod crowd;
 pub mod metrics;
 pub mod oracle;
 pub mod pathing;
