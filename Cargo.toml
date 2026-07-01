@@ -1,0 +1,17 @@
+[package]
+name = "screeps-rover-eval"
+version = "0.1.0"
+authors = ["William Archbell <william@archbell.com>"]
+edition = "2021"
+description = "Offline simulator + benchmark for screeps-rover (ADR 0033): drive the REAL rover LocalPathfinder / MovementSystem over a screeps-sim-core movement world, and gate pathing quality (route optimality, fatigue efficiency, congestion) + algorithmic/ops CPU against a ground-truth oracle. Host-only; reuses the sim-core kernel (no re-ported physics)."
+
+# A host-only workspace MEMBER (the measurement layer). Excluded from the wasm build aliases in
+# .cargo/config.toml. Git deps redirected to local member paths by the root [patch] table.
+
+[dependencies]
+screeps-game-api = "0.23"
+# The shared movement kernel (world + terrain + body + the mover). No `rover` feature yet — Tier A
+# drives rover's LocalPathfinder directly; the offline MovementSystem driver (Tier B) arrives with M1.
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core" }
+# The pathfinder + Dijkstra oracle UNDER TEST (pure/offline build — no `screeps` feature).
+screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }
