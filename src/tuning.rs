@@ -17,6 +17,15 @@
 //! corridor + repath-flap livelock) — the tournament's standing question is whether a config heals
 //! them without degrading the healthy rooms. If one does, the tuned optimum becomes rover's
 //! shipped DEFAULT (operator directive), with this tournament as the recorded rationale.
+//!
+//! Two corpora: [`corpus`] (fast — 4 synthetics + 3 real rooms, what the checked-in tests run) and
+//! [`corpus_full`] (`TUNE_FULL_CORPUS=1` — all 13 real rooms + 2 multi-room border routes, priced
+//! by the solo-T* baseline, [`crate::haul::t_star_rtt_solo`]). The tuned `reuse_path_length: 20`
+//! default was RE-CONFIRMED on the full corpus 2026-07-01 (rover `e80b1dd`): reuse(5) H 0.8967 /
+//! completion 0.979 / 4583 parked-blocker intents vs reuse(20) H 0.9036 / 1.000 / 240 (on the
+//! ladder(8) incumbent), reuse(40) exactly ties 20 — commitment past one round trip buys nothing.
+//! `ladder(8)` again adds H on top (default-thresholds H 0.8840 → 0.9036) at 4× the parked-intent
+//! burn; it stays a recorded candidate gated on a combat-corpus tournament (unchanged decision).
 
 use crate::base_traffic::{base_scenario, captured_layouts, energy_traffic_fleet};
 use crate::haul::{run_haul_fleet_with, HaulAssignment};
@@ -79,6 +88,10 @@ fn balanced_hauler() -> SimBody {
     use screeps::Part;
     SimBody::unboosted(&[Part::Carry, Part::Carry, Part::Move, Part::Move])
 }
+
+/// The real rooms the FAST corpus keeps (shared with [`corpus_full`], which adds the rest): one
+/// healthy room as the regression floor + the two formerly-starved rooms as the healing ratchets.
+const FAST_ROOM_PICKS: &[&str] = &["E11N13", "E13S29", "E11N17"];
 
 /// The default tuning corpus: the four synthetic mechanism scenarios (free-flow floor, one-gap
 /// pinch, crossing routes, road-through-swamp) + three REAL layouts — one healthy room as the
@@ -150,9 +163,8 @@ pub fn corpus() -> Vec<TuneScenario> {
 
     // Real foreman-planned layouts: the first healthy room (regression floor) + both starved rooms
     // (the park-sealed-corridor repath-flap livelock — the healing targets).
-    let picks = ["E11N13", "E13S29", "E11N17"];
     for layout in captured_layouts() {
-        if !picks.contains(&layout.room.as_str()) {
+        if !FAST_ROOM_PICKS.contains(&layout.room.as_str()) {
             continue;
         }
         let terrain = base_scenario(&layout);
@@ -164,6 +176,79 @@ pub fn corpus() -> Vec<TuneScenario> {
             tick_cap: 2_500,
         });
     }
+    scenarios
+}
+
+/// The **FULL** tuning corpus (`TUNE_FULL_CORPUS=1` on the staged sweep; the checked-in fast tests
+/// keep [`corpus`] so the suite stays sub-second): [`corpus`] + ALL remaining captured real
+/// layouts (13 rooms total — every `captured_layouts()` entry) + two multi-room border-route
+/// scenarios, the C-family axis the fast corpus lacks. Cross-room assignments are priced by the
+/// SOLO baseline ([`crate::haul::t_star_rtt_solo`] — η = pure contention loss; the single-room
+/// oracle cannot serve there), so their samples pool into the same `H`. Multi-room worlds share
+/// ONE `SimTerrain` for every room (mirrored rooms — `MovementState.rooms` stays empty), matching
+/// the cost source, which answers the same matrix for any room; DISTINCT per-room terrain needs a
+/// `cost.rs` extension first (owned elsewhere).
+pub fn corpus_full() -> Vec<TuneScenario> {
+    let mut scenarios = corpus();
+
+    // The 10 real rooms the fast corpus skips ([`FAST_ROOM_PICKS`] carries the other three).
+    // Same tick cap as the fast corpus's rooms: every captured room completes in < 200 ticks under
+    // the shipped default (the base_traffic baseline report), so 2500 is an order of magnitude of
+    // headroom, not a tuned number.
+    for layout in captured_layouts() {
+        if FAST_ROOM_PICKS.contains(&layout.room.as_str()) {
+            continue;
+        }
+        let terrain = base_scenario(&layout);
+        let fleet = energy_traffic_fleet(&layout, &terrain);
+        scenarios.push(TuneScenario {
+            name: format!("base:{}", layout.room),
+            terrain,
+            fleet,
+            tick_cap: 2_500,
+        });
+    }
+
+    let hauler = |source: Position, sink: Position| HaulAssignment {
+        body: balanced_hauler(),
+        q: 100,
+        source,
+        sink,
+        trips: 2,
+    };
+
+    // Multi-room plain border route: 2 haulers cycling W1N1(10,25) → W2N1(40,25) — out through
+    // W1N1's WEST exit (x=0 relocates to W2N1 x=49, the kernel edge-exit rule) and back. Prices
+    // the border round trip end-to-end (the `aaac0f7` border-thrash class) under mild same-route
+    // contention.
+    scenarios.push(TuneScenario {
+        name: "border_plain".into(),
+        terrain: SimTerrain::default(),
+        fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W2N1", 40, 25))).collect(),
+        tick_cap: 800,
+    });
+
+    // Swampy variant: all-swamp except a 1-wide road corridor at y=25 (the shared terrain makes
+    // the corridor border-continuous by construction). Off-road passing costs real fatigue
+    // (loaded balanced hauler: +20/step, regen 4), so out-leg/back-leg exchanges stress
+    // commitment + escalation ACROSS the border — the cross-room analogue of the E13S29
+    // corridor-mouth mechanism the tuned reuse default healed.
+    let mut swamp_corridor = SimTerrain::default();
+    for x in 0..=49u8 {
+        for y in 0..=49u8 {
+            if y != 25 {
+                swamp_corridor.swamps.insert((x, y));
+            }
+        }
+        swamp_corridor.roads.insert((x, 25));
+    }
+    scenarios.push(TuneScenario {
+        name: "border_swamp_road".into(),
+        terrain: swamp_corridor,
+        fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W2N1", 40, 25))).collect(),
+        tick_cap: 2_000,
+    });
+
     scenarios
 }
 
@@ -271,6 +356,38 @@ mod tests {
         );
     }
 
+    /// The full-corpus ratchet, added with the corpus widening (2026-07-01): the shipped default
+    /// must hold the hard gates AND complete on ALL 13 real rooms + both multi-room border routes.
+    /// H here is NOT comparable 1:1 with the fast corpus's H (border samples are solo-baselined —
+    /// pure contention loss — so they pull the pool up, real rooms keep the stricter oracle).
+    /// Measured under the shipped default at widening time (rover `e80b1dd`, the tournament's
+    /// stage-1 incumbent line): H=0.8840 CI95=[0.8546,0.9112], completion 1.000, parked 64. The
+    /// floor below is that measurement minus CI-scale slack for corpus evolution, mechanism-named
+    /// per the no-silent-gates rule — a regression through it means the widened corpus lost real
+    /// value-weighted efficiency, not noise.
+    #[test]
+    fn default_config_holds_gates_on_the_full_corpus() {
+        let score = evaluate_config(&MoverConfig::default(), &corpus_full(), 1);
+        eprintln!(
+            "[tuning FULL-CORPUS default] H={:.4} CI95=[{:.4},{:.4}] p05={:.3} done={:.3} parked={} ticks={}",
+            score.h, score.ci95.0, score.ci95.1, score.p05, score.completion,
+            score.failed_into_parked, score.total_ticks
+        );
+        assert!(score.gates_held, "default config on the full corpus: {score:?}");
+        // The widened completion ratchet — the fast corpus's starvation ratchet, over every room
+        // + the border routes: a config regression that re-starves ANY of them fails here.
+        assert!(
+            (score.completion - 1.0).abs() < 1e-9,
+            "the tuned default must complete the FULL corpus, got {}",
+            score.completion
+        );
+        assert!(
+            score.h > 0.80,
+            "full-corpus pooled objective under the shipped default (measured 0.8840), got {}",
+            score.h
+        );
+    }
+
     /// Same config + corpus + seed ⇒ byte-identical score (the param_sweep determinism pin).
     #[test]
     fn evaluation_is_deterministic() {
@@ -279,6 +396,23 @@ mod tests {
         assert_eq!(a.ranked_key(), b.ranked_key());
         assert_eq!(a.h.to_bits(), b.h.to_bits(), "bit-identical H");
         assert_eq!(a.intents_issued, b.intents_issued);
+    }
+
+    /// The determinism pin over the NEW cross-room T* path: the border scenarios' η is priced by
+    /// `t_star_rtt_solo` (a nested sim run, not the closed-form oracle), so pin that the whole
+    /// solo-baseline + fleet pipeline is byte-reproducible too. Only the 2 border scenarios run —
+    /// cheap enough for the checked-in fast pass.
+    #[test]
+    fn cross_room_evaluation_is_deterministic() {
+        let border: Vec<TuneScenario> = corpus_full()
+            .into_iter()
+            .filter(|s| s.name.starts_with("border_"))
+            .collect();
+        assert_eq!(border.len(), 2, "both border scenarios present in the full corpus");
+        let a = evaluate_config(&MoverConfig::default(), &border, 7);
+        let b = evaluate_config(&MoverConfig::default(), &border, 7);
+        assert_eq!(a.ranked_key(), b.ranked_key());
+        assert_eq!(a.h.to_bits(), b.h.to_bits(), "bit-identical H over the solo-T* path");
     }
 
     /// The escalation knob must actually REACH rover end-to-end: an absurdly slow ladder on the
@@ -324,11 +458,16 @@ mod tests {
     /// forward). `#[ignore]`: run on demand —
     /// `cargo test -p screeps-rover-eval tune_rover_parameters -- --ignored --nocapture`
     /// Env overrides: `TUNE_ESCALATION` (avoid_friendly ladder bases), `TUNE_REUSE`,
-    /// `TUNE_OPS`, `TUNE_SHOVE`, `TUNE_FRIENDLY_DIST` (comma lists).
+    /// `TUNE_OPS`, `TUNE_SHOVE`, `TUNE_FRIENDLY_DIST` (comma lists);
+    /// `TUNE_FULL_CORPUS=1` swaps in [`corpus_full`] (all 13 real rooms + the border routes).
     #[test]
     #[ignore]
     fn tune_rover_parameters() {
-        let corpus = corpus();
+        let corpus = if std::env::var("TUNE_FULL_CORPUS").ok().as_deref() == Some("1") {
+            corpus_full()
+        } else {
+            corpus()
+        };
         let escalations = env_u16_list("TUNE_ESCALATION", &[1, 2, 4, 8]);
         let reuses = env_u32_list("TUNE_REUSE", &[2, 5, 10, 20]);
         let opses = env_u32_list("TUNE_OPS", &[5_000, 20_000, 60_000]);

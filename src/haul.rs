@@ -60,7 +60,8 @@ pub struct HaulOutcome {
 /// route loaded (carry `q`) source→sink, then empty back — in ONE continuous simulation
 /// ([`traverse_cycle`]), so residual fatigue at the turn is paid exactly as a real creep pays it.
 /// The route is the fatigue-cost optimum (the `r_ticks` approximation, documented there). `None`
-/// if unreachable.
+/// if unreachable. **Single-room only** ([`optimal_path`] is room-blind over `(x, y)`) — a
+/// cross-room assignment must use [`t_star_rtt_solo`] instead (the fleet runner routes this).
 pub fn t_star_rtt(terrain: &SimTerrain, a: &HaulAssignment) -> Option<u32> {
     let room = a.source.room_name();
     let cap = 10_000;
@@ -80,11 +81,50 @@ pub fn t_star_rtt(terrain: &SimTerrain, a: &HaulAssignment) -> Option<u32> {
     cycle.reached.then_some(cycle.ticks)
 }
 
+/// Generous cap for the SOLO baseline run (mirrors `t_star_rtt`'s oracle-walk cap): any sane
+/// assignment's uncontended round trip is orders of magnitude shorter; hitting it means the
+/// scenario is mis-built (unreachable/starved solo), which `t_star_rtt_solo` reports as `None`.
+const SOLO_TICK_CAP: u32 = 10_000;
+
+/// The **SOLO baseline** T*: the assignment run as a 1-hauler fleet (`trips = 1`) through the same
+/// [`simulate_fleet`] machinery in an otherwise-empty world, taking its realized round-trip ticks.
+///
+/// **Semantic difference from [`t_star_rtt`], loudly:** the oracle T* is the fatigue-exact
+/// *optimal* round trip, so oracle-based η also penalizes route-quality loss. Solo-T* baselines
+/// against **rover's own uncontended behavior under the same `config`** — η then measures pure
+/// CONTENTION/coordination loss, and a config that solo-paths a poor route is NOT penalized here
+/// (route quality vs the true optimum stays Tier-A's job: [`crate::metrics`] `R_ticks`/`R_fatigue`
+/// over [`crate::traverse`]). It exists because the single-room oracle cannot price a cross-room
+/// route ([`optimal_path`] is a room-grid Dijkstra over `(x, y)` alone — fed a cross-room pair it
+/// would silently price the coordinates as if co-roomed); the multi-room optimum is ADR 0033
+/// §D5.4 open decision #10. Single-room assignments keep the stricter oracle. The baseline is the
+/// FIRST round trip alone (cold path cache, zero fatigue) — later contended trips inherit
+/// fatigue/cache state, which is part of what the fleet run measures.
+pub fn t_star_rtt_solo(terrain: &SimTerrain, a: &HaulAssignment, config: &MoverConfig) -> Option<u32> {
+    let solo = HaulAssignment { trips: 1, ..a.clone() };
+    let sim = simulate_fleet(terrain, std::slice::from_ref(&solo), SOLO_TICK_CAP, config);
+    if sim.deadlocked {
+        return None;
+    }
+    sim.trip_ticks[0].first().copied()
+}
+
 /// Which leg of the round trip a hauler is on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Leg {
     ToSink,
     ToSource,
+}
+
+/// The raw realized fleet simulation, pre-scoring: per-assignment completed round-trip tick
+/// lists + the audit. Shared by [`run_haul_fleet_with`] (which scores it against T*) and by
+/// [`t_star_rtt_solo`] (which IS the cross-room baseline: the same sim, fleet of one).
+struct FleetSim {
+    /// Completed round-trip tick counts, per assignment, in completion order.
+    trip_ticks: Vec<Vec<u32>>,
+    audit: IntentAudit,
+    ticks: u32,
+    deadlocked: bool,
 }
 
 /// Run the fleet: every hauler starts at its source, loaded, and cycles until its trips are done or
@@ -109,11 +149,61 @@ pub fn run_haul_fleet_with(
     config: &MoverConfig,
 ) -> Option<HaulOutcome> {
     let n = fleet.len();
+    // T* per assignment: same-room ⇒ the fatigue-exact ORACLE round trip (strict — η also prices
+    // route quality); cross-room ⇒ the SOLO baseline (rover's own uncontended round trip under the
+    // same config — η prices pure contention/coordination loss; see `t_star_rtt_solo`'s loud
+    // semantic note for why the oracle cannot serve here).
     let t_stars: Vec<u32> = fleet
         .iter()
-        .map(|a| t_star_rtt(terrain, a))
+        .map(|a| {
+            if a.source.room_name() == a.sink.room_name() {
+                t_star_rtt(terrain, a)
+            } else {
+                t_star_rtt_solo(terrain, a, config)
+            }
+        })
         .collect::<Option<Vec<_>>>()?;
 
+    let sim = simulate_fleet(terrain, fleet, tick_cap, config);
+
+    // Samples: one per EXPECTED trip — completed trips score T*/T, never-completed trips score 0
+    // (the catastrophic tail stays visible in the distribution, per the objective design).
+    let mut samples: Vec<(f64, f64)> = Vec::new();
+    let mut completed = 0u32;
+    for i in 0..n {
+        let w = fleet[i].q as f64; // W = ρ·T* = Q — the hauler sample weight
+        for &rt in &sim.trip_ticks[i] {
+            samples.push(((t_stars[i] as f64 / rt.max(1) as f64).min(1.0), w));
+            completed += 1;
+        }
+        for _ in sim.trip_ticks[i].len() as u32..fleet[i].trips {
+            samples.push((0.0, w));
+        }
+    }
+
+    Some(HaulOutcome {
+        summary: Summary::of(&samples, seed),
+        samples,
+        audit: sim.audit,
+        completed_trips: completed,
+        expected_trips: fleet.iter().map(|a| a.trips).sum(),
+        ticks: sim.ticks,
+        deadlocked: sim.deadlocked,
+    })
+}
+
+/// Drive the fleet through the real rover `MovementSystem` tick loop (no scoring). Multi-room
+/// worlds: `MovementState.rooms` is left EMPTY, so `terrain` serves every room a route touches
+/// (mirrored rooms — the kernel's `terrain_for` fallback). That matches [`WorldCostSource`], which
+/// answers the same matrix for any room; per-room terrain needs a `cost.rs` extension first
+/// (owned elsewhere — until then multi-room scenarios must share one terrain shape).
+fn simulate_fleet(
+    terrain: &SimTerrain,
+    fleet: &[HaulAssignment],
+    tick_cap: u32,
+    config: &MoverConfig,
+) -> FleetSim {
+    let n = fleet.len();
     let mut world = MovementState {
         terrain: terrain.clone(),
         creeps: fleet
@@ -218,30 +308,12 @@ pub fn run_haul_fleet_with(
         }
     }
 
-    // Samples: one per EXPECTED trip — completed trips score T*/T, never-completed trips score 0
-    // (the catastrophic tail stays visible in the distribution, per the objective design).
-    let mut samples: Vec<(f64, f64)> = Vec::new();
-    let mut completed = 0u32;
-    for i in 0..n {
-        let w = fleet[i].q as f64; // W = ρ·T* = Q — the hauler sample weight
-        for &rt in &trip_ticks[i] {
-            samples.push(((t_stars[i] as f64 / rt.max(1) as f64).min(1.0), w));
-            completed += 1;
-        }
-        for _ in trip_ticks[i].len() as u32..fleet[i].trips {
-            samples.push((0.0, w));
-        }
-    }
-
-    Some(HaulOutcome {
-        summary: Summary::of(&samples, seed),
-        samples,
+    FleetSim {
+        trip_ticks,
         audit,
-        completed_trips: completed,
-        expected_trips: fleet.iter().map(|a| a.trips).sum(),
         ticks,
         deadlocked,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +395,66 @@ mod tests {
         assert!((total_w - 500.0).abs() < 1e-9, "Σ weights = Σ cargo over expected trips (2×100 + 1×300)");
         // The big-cargo hauler dominates H: its single trip carries 60% of the fleet weight.
         assert!(out.samples.iter().any(|&(_, w)| (w - 300.0).abs() < 1e-9));
+    }
+
+    fn pos_in_room(room: &str, x: u8, y: u8) -> Position {
+        let room: RoomName = room.parse().unwrap();
+        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+    }
+
+    #[test]
+    fn cross_room_route_scores_against_the_solo_baseline() {
+        // W1N1(10,25) → W2N1(40,25): out through W1N1's WEST exit (x=0 relocates to W2N1 x=49 —
+        // the kernel edge-exit rule, tick.rs), ~19 steps out + ~19 back. One shared plain terrain
+        // serves both rooms (MovementState.rooms empty — the mirrored-room design).
+        let terrain = SimTerrain::default();
+        let a = HaulAssignment {
+            body: balanced_hauler(),
+            q: 100,
+            source: pos_in_room("W1N1", 10, 25),
+            sink: pos_in_room("W2N1", 40, 25),
+            trips: 1,
+        };
+        let solo = t_star_rtt_solo(&terrain, &a, &MoverConfig::default())
+            .expect("the border route is solo-solvable");
+        // The trip genuinely crosses the border: the geometric minimum is 35 ticks — out 18
+        // (10 steps to the exit, which relocates to W2N1 x=49 same-tick, + 8 to range 1 of the
+        // sink) + back 17 (8 to the exit + 9 to range 1 of the source). Realized 37 (deterministic).
+        assert!(solo >= 35, "solo round trip spans both rooms, got {solo} ticks");
+
+        // A LONE cross-room hauler scores η ≡ 1 by construction: the fleet run IS the baseline run
+        // (same deterministic sim, fleet of one, first trip) — solo-T* measures contention only.
+        let out = run_haul_fleet(&terrain, &[a], 500, 1).expect("solvable");
+        assert_eq!(out.completed_trips, 1);
+        assert!(!out.deadlocked);
+        assert!(
+            (out.summary.weighted_mean - 1.0).abs() < 1e-9,
+            "uncontended cross-room η is exactly 1 against the solo baseline: H = {}",
+            out.summary.weighted_mean
+        );
+    }
+
+    #[test]
+    fn contended_border_route_completes_with_gates_held() {
+        // Two haulers cycling the same cross-room route: the solo baseline prices each trip, the
+        // contention shows up as H ≤ 1, and the hard gates (no deadlock, zero unexplained
+        // rejections) must hold across the border exactly as they do in-room.
+        let terrain = SimTerrain::default();
+        let fleet: Vec<HaulAssignment> = (0..2)
+            .map(|_| HaulAssignment {
+                body: balanced_hauler(),
+                q: 100,
+                source: pos_in_room("W1N1", 10, 25),
+                sink: pos_in_room("W2N1", 40, 25),
+                trips: 2,
+            })
+            .collect();
+        let out = run_haul_fleet(&terrain, &fleet, 800, 1).expect("solvable");
+        assert_eq!(out.completed_trips, out.expected_trips, "all border trips complete");
+        assert!(!out.deadlocked);
+        assert_eq!(out.audit.failed_coordination, 0, "no unexplained rejections at the border");
+        let h = out.summary.weighted_mean;
+        assert!(h > 0.0 && h <= 1.0, "solo-baselined H stays in (0, 1]: {h}");
     }
 
     #[test]
