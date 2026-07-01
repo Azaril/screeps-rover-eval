@@ -162,7 +162,7 @@ mod tests {
             }
         }
         let r = r_fatigue(&terrain, pos(10, 25), pos(20, 25), 0).expect("reachable, complete");
-        assert!(r >= 1.0 && r <= 1.05, "rover should skirt the swamp near-optimally, got {r}");
+        assert!((1.0..=1.05).contains(&r), "rover should skirt the swamp near-optimally, got {r}");
     }
 
     /// A road punched straight through a full-height swamp band: the fatigue-optimal route runs down
@@ -179,7 +179,7 @@ mod tests {
             terrain.roads.insert((x, 25)); // a straight road through the band at y=25
         }
         let r = r_fatigue(&terrain, pos(10, 25), pos(20, 25), 0).expect("reachable, complete");
-        assert!(r >= 1.0 && r <= 1.05, "rover should take the road across the swamp band, got {r}");
+        assert!((1.0..=1.05).contains(&r), "rover should take the road across the swamp band, got {r}");
     }
 
     use screeps::Part;
@@ -237,6 +237,6 @@ mod tests {
         terrain.swamps.insert((15, 25)); // one swamp tile straddling the direct line
         let body = SimBody::unboosted(&[Part::Attack, Part::Attack, Part::Move]);
         let r = r_ticks(&terrain, &body, 0, pos(10, 25), pos(20, 25), 0).expect("complete");
-        assert!(r >= 1.0 && r <= 1.1, "rover skirts the swamp near-time-optimally, got {r}");
+        assert!((1.0..=1.1).contains(&r), "rover skirts the swamp near-time-optimally, got {r}");
     }
 }

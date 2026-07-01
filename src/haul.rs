@@ -16,7 +16,9 @@ use crate::crowd::IntentAudit;
 use crate::oracle::optimal_path;
 use crate::stats::Summary;
 use crate::traverse::{pos_in, traverse_cycle};
+use crate::value::{quantize_w, Role};
 use screeps::Position;
+use screeps_rover::StuckThresholds;
 use screeps_sim_core::resolve_movement;
 use screeps_sim_core::{
     resolve_moves_via_system_with, MoveIntents, MovementState, MoverConfig, SimBody, SimCreep,
@@ -27,6 +29,56 @@ use screeps_sim_core::{
 const ENDPOINT_RANGE: u32 = 1;
 /// Consecutive zero-movement ticks (work remaining) that count as a deadlock.
 const DEADLOCK_TICKS: u32 = 12;
+
+/// A [`StuckThresholds`] ladder built from its tier-1 base with the default tier SPACING ratios —
+/// one scalar ("escalation speed") instead of six independent axes. Lives here (not
+/// [`crate::tuning`]) because `ladder(8)` is the haul driver's shipped per-request default
+/// ([`FleetOpts`]); the tournament sweeps the same helper as its escalation axis.
+pub fn ladder(avoid_friendly: u16) -> StuckThresholds {
+    let d = StuckThresholds::default();
+    let scale =
+        |v: u16| ((v as u32 * avoid_friendly as u32).div_ceil(d.avoid_friendly_creeps as u32)) as u16;
+    StuckThresholds {
+        avoid_friendly_creeps: avoid_friendly.max(1),
+        avoid_all_friendly_creeps: scale(d.avoid_all_friendly_creeps).max(avoid_friendly + 1),
+        increase_ops: scale(d.increase_ops),
+        enable_shoving: scale(d.enable_shoving),
+        report_failure: scale(d.report_failure),
+        no_progress_repath: scale(d.no_progress_repath),
+    }
+}
+
+/// Per-fleet driver options layered over the run's [`MoverConfig`] — the request-shaping knobs
+/// (what each HAUL request carries), where `MoverConfig` is the system-level knobs. Split so the
+/// combat adjudication's end-state holds by construction: nothing here touches
+/// `MoverConfig::stuck_thresholds` (military's ladder), only the haul requests' own lane.
+#[derive(Clone, Debug)]
+pub struct FleetOpts {
+    /// Per-REQUEST stuck ladder set on every haul request
+    /// ([`SimMoveRequest::with_stuck_thresholds`]). `None` = the run config's system ladder.
+    /// **Default `Some(ladder(8))`** — BANKED 2026-07-01 per the combat adjudication's
+    /// split-defaults verdict (combat-eval `mover_adjudication.rs`: ladder(8) is
+    /// congestion-negative for military, so it ships per-request, combat untouched by
+    /// construction): on the widened full corpus the gain survives the move from global to
+    /// per-request — H 0.9164 → 0.9455, fewer total ticks (1660 → 1524), gates green.
+    pub haul_stuck_thresholds: Option<StuckThresholds>,
+    /// §D5.4 decision-(9) value triage (benchmark side): bid each hauler's request
+    /// `priority_value = quantize_w(ρ)` with `ρ = Q/T*_rtt` ([`Role::Haul`]'s `rate_e_t`) — the
+    /// milli-e/t lane between the `Low`/`Normal` anchors, so big-cargo-per-tick haulers win
+    /// contested tiles first. `false` = enum-anchor ordering (all haulers tie at `Normal`).
+    /// **Default `true`** — the HARNESS recommendation (measured 2026-07-01: full corpus
+    /// H 0.9455 → 0.9626 on top of the banked ladder, heterogeneous pinch 0.8215 → 0.9411 alone,
+    /// gates green); RUNTIME adoption (quantized `w` replacing the live resolver's enum priority)
+    /// stays gated on the combat-side tournament (§D5.4 decision (9) / M5 follow-up (7)) — not
+    /// this crate's call.
+    pub value_priority: bool,
+}
+
+impl Default for FleetOpts {
+    fn default() -> Self {
+        FleetOpts { haul_stuck_thresholds: Some(ladder(8)), value_priority: true }
+    }
+}
 
 /// One hauler's task: cycle `q` cargo units per round trip between `source` and `sink`, `trips`
 /// times. Multiple assignments may share endpoints — that contention is what the fleet run measures.
@@ -101,8 +153,20 @@ const SOLO_TICK_CAP: u32 = 10_000;
 /// FIRST round trip alone (cold path cache, zero fatigue) — later contended trips inherit
 /// fatigue/cache state, which is part of what the fleet run measures.
 pub fn t_star_rtt_solo(terrain: &SimTerrain, a: &HaulAssignment, config: &MoverConfig) -> Option<u32> {
+    t_star_rtt_solo_opts(terrain, a, config, &FleetOpts::default())
+}
+
+/// [`t_star_rtt_solo`] under explicit [`FleetOpts`]: the baseline run carries the SAME per-request
+/// shaping as the fleet run it prices (a solo creep is never stuck/contended, so the opts are
+/// inert today — passed through so the "same config" contract stays literal as opts grow).
+pub fn t_star_rtt_solo_opts(
+    terrain: &SimTerrain,
+    a: &HaulAssignment,
+    config: &MoverConfig,
+    opts: &FleetOpts,
+) -> Option<u32> {
     let solo = HaulAssignment { trips: 1, ..a.clone() };
-    let sim = simulate_fleet(terrain, std::slice::from_ref(&solo), SOLO_TICK_CAP, config);
+    let sim = simulate_fleet(terrain, std::slice::from_ref(&solo), SOLO_TICK_CAP, config, opts, &[None]);
     if sim.deadlocked {
         return None;
     }
@@ -140,13 +204,27 @@ pub fn run_haul_fleet(
 }
 
 /// [`run_haul_fleet`] under explicit rover tunables — the evaluation primitive the parameter
-/// tournament ([`crate::tuning`]) scores one [`MoverConfig`] point with.
+/// tournament ([`crate::tuning`]) scores one [`MoverConfig`] point with. Runs the default
+/// [`FleetOpts`] — the haul-driver end-state ([`run_haul_fleet_opts`] takes explicit opts).
 pub fn run_haul_fleet_with(
     terrain: &SimTerrain,
     fleet: &[HaulAssignment],
     tick_cap: u32,
     seed: u32,
     config: &MoverConfig,
+) -> Option<HaulOutcome> {
+    run_haul_fleet_opts(terrain, fleet, tick_cap, seed, config, &FleetOpts::default())
+}
+
+/// [`run_haul_fleet_with`] under explicit [`FleetOpts`] — the A/B surface for the per-request
+/// knobs (haul-lane stuck ladder, §D5.4 value triage).
+pub fn run_haul_fleet_opts(
+    terrain: &SimTerrain,
+    fleet: &[HaulAssignment],
+    tick_cap: u32,
+    seed: u32,
+    config: &MoverConfig,
+    opts: &FleetOpts,
 ) -> Option<HaulOutcome> {
     let n = fleet.len();
     // T* per assignment: same-room ⇒ the fatigue-exact ORACLE round trip (strict — η also prices
@@ -159,12 +237,25 @@ pub fn run_haul_fleet_with(
             if a.source.room_name() == a.sink.room_name() {
                 t_star_rtt(terrain, a)
             } else {
-                t_star_rtt_solo(terrain, a, config)
+                t_star_rtt_solo_opts(terrain, a, config, opts)
             }
         })
         .collect::<Option<Vec<_>>>()?;
 
-    let sim = simulate_fleet(terrain, fleet, tick_cap, config);
+    // Value-triage bids (decision (9), benchmark side): w = ρ = Q/T*_rtt per assignment, quantized
+    // to the milli-e/t lane. Computed HERE (not in `simulate_fleet`) because T* is the scoring
+    // baseline this function already owns; the sim only carries the resolved i64 bids.
+    let w_bids: Vec<Option<i64>> = if opts.value_priority {
+        fleet
+            .iter()
+            .zip(&t_stars)
+            .map(|(a, &t)| Some(quantize_w(Role::Haul { q: a.q }.rate_e_t(t))))
+            .collect()
+    } else {
+        vec![None; n]
+    };
+
+    let sim = simulate_fleet(terrain, fleet, tick_cap, config, opts, &w_bids);
 
     // Samples: one per EXPECTED trip — completed trips score T*/T, never-completed trips score 0
     // (the catastrophic tail stays visible in the distribution, per the objective design).
@@ -197,11 +288,14 @@ pub fn run_haul_fleet_with(
 /// (mirrored rooms — the kernel's `terrain_for` fallback). That matches [`WorldCostSource`], which
 /// answers the same matrix for any room; per-room terrain needs a `cost.rs` extension first
 /// (owned elsewhere — until then multi-room scenarios must share one terrain shape).
+/// `w_bids[i]` = assignment i's quantized value bid (`None` = enum anchor), indexed like `fleet`.
 fn simulate_fleet(
     terrain: &SimTerrain,
     fleet: &[HaulAssignment],
     tick_cap: u32,
     config: &MoverConfig,
+    opts: &FleetOpts,
+    w_bids: &[Option<i64>],
 ) -> FleetSim {
     let n = fleet.len();
     let mut world = MovementState {
@@ -237,7 +331,8 @@ fn simulate_fleet(
         if (0..n).all(|i| done(&trips_done, i)) {
             break;
         }
-        // One request per active hauler, toward its current leg's goal.
+        // One request per active hauler, toward its current leg's goal — carrying the per-request
+        // haul-lane shaping: the split-defaults stuck ladder and (if triaging) the value bid.
         let reqs: Vec<SimMoveRequest> = (0..n)
             .filter(|&i| !done(&trips_done, i))
             .map(|i| {
@@ -245,7 +340,14 @@ fn simulate_fleet(
                     Leg::ToSink => fleet[i].sink,
                     Leg::ToSource => fleet[i].source,
                 };
-                SimMoveRequest::move_to(world.creeps[i].id, goal, ENDPOINT_RANGE)
+                let mut req = SimMoveRequest::move_to(world.creeps[i].id, goal, ENDPOINT_RANGE);
+                if let Some(thresholds) = &opts.haul_stuck_thresholds {
+                    req = req.with_stuck_thresholds(thresholds.clone());
+                }
+                if let Some(bid) = w_bids.get(i).copied().flatten() {
+                    req = req.with_priority_value(bid);
+                }
+                req
             })
             .collect();
         let requested: std::collections::HashSet<u32> = reqs.iter().map(|r| r.creep).collect();
@@ -479,28 +581,29 @@ mod tests {
         let out = run_haul_fleet(&terrain, &fleet, 2000, 1).expect("solvable");
         assert_eq!(out.completed_trips, out.expected_trips, "everyone finishes eventually");
         assert!(!out.deadlocked);
-        // Mechanism-aware gates (root-caused via the head-on tick trace, 2026-07-01): rejections
-        // whose blocking chain ends at a PARKED (finished, unrequested) creep are rover's designed
-        // optimism cost — `ticks_immobile ≥ 2` of failed intents per blocking event before the
-        // friendly-avoid repath fires; bounded per event, never linear. (The linear-forever case was
-        // the kernel driver's missing CPU budget — rover treats an absent budget as EXHAUSTED and
-        // never stuck-repaths; fixed in sim-core.) Rejections involving ACTIVE creeps the resolver
-        // planned are unexplained divergence and gate at zero, always.
+        // Mechanism-aware gates, RE-PINNED for registration-ON (coordination-v2, 2026-07-01):
+        // parked creeps are resolver-known stationary occupants, so a contest against one is a
+        // resolver DENIAL (feeding the escalation ladder via denial-as-stuck) or a shove of the
+        // synthesized idle entry — never an engine-rejected intent. Both audit classes therefore
+        // catch only true resolver↔engine divergence and gate `== 0` (was `<= 8` bounded optimism
+        // burn when registration was OFF and rover discovered parkers by colliding with them —
+        // that historical mechanism is retold at `IntentAudit::failed_into_parked`).
         assert_eq!(
             out.audit.failed_coordination, 0,
             "unexplained active-creep rejections: {} of {}",
             out.audit.failed_coordination, out.audit.intents_issued
         );
-        assert!(
-            out.audit.failed_into_parked <= 8,
-            "parked-blocker optimism must stay bounded per event: {} of {}",
+        assert_eq!(
+            out.audit.failed_into_parked, 0,
+            "registered parkers never draw engine-rejected intents: {} of {}",
             out.audit.failed_into_parked,
             out.audit.intents_issued
         );
-        assert!(
-            out.audit.failed_move_rate() < 0.05,
-            "wasted-intent rate must be marginal, got {:.4}",
-            out.audit.failed_move_rate()
+        assert_eq!(
+            out.audit.failed_moves, 0,
+            "the issued move-set is fully self-consistent under registration-ON, got {} of {}",
+            out.audit.failed_moves,
+            out.audit.intents_issued
         );
         let h = out.summary.weighted_mean;
         assert!(h > 0.0 && h < 1.0, "shared-route contention costs real efficiency: H = {h}");

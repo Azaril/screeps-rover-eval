@@ -79,11 +79,19 @@ pub struct IntentAudit {
     /// Failed moves issued INTO a wall or off the room edge — an outright pathing bug.
     pub failed_wall: u32,
     /// Failed moves whose blocking chain terminates at a **parked** creep — one that reached its
-    /// goal and left the request set, making it invisible to rover's resolver AND to its optimistic
-    /// first-path (`friendly_creeps: false` until `ticks_immobile ≥ 2` escalates). This is rover's
-    /// *designed, live-faithful* optimism cost: bounded per blocking event (≈ the stuck threshold),
-    /// self-healing via the friendly-avoid repath. Root-caused 2026-07-01 (head-on tube trace);
-    /// regression-tracked, never silently folded into the strict class below.
+    /// goal and left the request set. What the mover knows about it is
+    /// [`screeps_sim_core::MoverConfig::register_idle_creeps`]'s call. Under the shipped default
+    /// (ON since the parked-creep-coordination-v2 slice, 2026-07-01 — live parity) parked tiles
+    /// are handed to the resolver up front, contests against them resolve as resolver DENIALS
+    /// (which feed the escalation ladder via denial-as-stuck) or as shoves of the synthesized
+    /// idle entries — never as engine-rejected intents — so this class is **0 by mechanism and
+    /// gated `== 0` alongside `failed_coordination`**: any nonzero value means the resolver
+    /// issued a move into a tile it was TOLD was occupied, true divergence. The historical
+    /// registration-OFF behavior (rover's optimistic first-path prices no friendlies, a later
+    /// creep burned `ticks_immobile ≥ 2` rejected intents per blocking event before the
+    /// friendly-avoid repath fired — the designed, bounded optimism cost, root-caused 2026-07-01
+    /// via the head-on tube trace) stays reachable through `register_idle_creeps: false` A/B
+    /// runs, where this class is the bounded-burn regression signal it originally was.
     pub failed_into_parked: u32,
     /// Failed moves the resolver had FULL knowledge to avoid: contention lost to, or chain-blocked
     /// behind, an **active** (requested) creep. The resolver plans exactly these creeps as one
@@ -97,9 +105,12 @@ impl IntentAudit {
     /// Reconcile one tick's issued `dirs` against the executed `moved` set, classifying each
     /// rejected intent. `before`/`fatigued` are the tick-start snapshots indexed by `id − 1`;
     /// `requested` is the set of creep ids the driver put in this tick's `MovementData` — the
-    /// creeps the resolver KNEW about. A rejection is walked down its blocking chain (a rejected
-    /// occupant's own destination, transitively): a chain ending at an unrequested (parked) creep
-    /// is the known optimism cost (`failed_into_parked`); anything else is `failed_coordination`.
+    /// creeps the resolver planned MOVES for (under `register_idle_creeps` the resolver may also
+    /// know parked tiles as stationary occupants; the audit classes by requested-or-not either
+    /// way, so the parked class stays comparable across both modes). A rejection is walked down
+    /// its blocking chain (a rejected occupant's own destination, transitively): a chain ending at
+    /// an unrequested (parked) creep is the known optimism cost (`failed_into_parked`); anything
+    /// else is `failed_coordination`.
     pub(crate) fn reconcile(
         &mut self,
         world: &MovementState,
@@ -185,8 +196,11 @@ impl IntentAudit {
 }
 
 /// Drive `creeps` to their goals through rover's `MovementSystem` + resolver, one tick at a time, over
-/// `terrain`. Arrived creeps stay put (becoming obstacles the resolver must route others around).
-/// Stops when all are within range, a deadlock is detected, or `tick_cap` elapses.
+/// `terrain`. Arrived creeps stay put and become parked blockers — this driver runs the default
+/// [`screeps_sim_core::MoverConfig`] (`register_idle_creeps: true` since the coordination-v2
+/// slice), so the resolver knows every parked tile up front: contests against parkers resolve as
+/// denials/shoves inside the resolver, and [`IntentAudit::failed_into_parked`] gates `== 0` (see
+/// the field doc). Stops when all are within range, a deadlock is detected, or `tick_cap` elapses.
 pub fn run_crowd(terrain: &SimTerrain, creeps: &[CrowdCreep], tick_cap: u32) -> CrowdReport {
     let n = creeps.len();
     let mut world = MovementState {
@@ -370,8 +384,10 @@ mod tests {
         // out of the tube and re-routes it around while the other marches through. The winner then
         // PARKS on its goal (the tube mouth), leaves the request set. Under the pre-tuning default
         // (`reuse_path_length: 5`) the re-routed creep re-optimized back onto the blocked short path
-        // and burned exactly `ticks_immobile ≥ 2` failed intents at the parked blocker; with the
-        // tournament-tuned commitment default (20) it sticks to its detour and wastes NOTHING.
+        // and burned exactly `ticks_immobile ≥ 2` failed intents at the parked blocker; the
+        // tournament-tuned commitment default (20) made it stick to its detour, and registration-ON
+        // (coordination-v2) now prices the parked mouth up front as well — both mechanisms
+        // independently hold this at zero.
         assert_eq!(
             r.audit.failed_coordination, 0,
             "any active-creep rejection is an unexplained resolver↔engine divergence"
@@ -410,11 +426,13 @@ mod tests {
             r.audit.failed_coordination, r.audit.intents_issued, r.audit.failed_fatigued,
             r.audit.failed_wall, r.audit.failed_into_parked
         );
-        // Early finishers park ON the ring where late paths cross — the same root-caused parked-
-        // blocker mechanism as the head-on tube; bounded per event, not linear.
-        assert!(
-            r.audit.failed_into_parked <= 4,
-            "parked-blocker optimism stays bounded: {} of {}",
+        // Early finishers park ON the ring where late paths cross. Under registration-ON (the
+        // shipped default) those parked tiles are resolver-known, so contests against them are
+        // denials/shoves, never engine rejections — the class gates at zero like coordination
+        // (was `<= 4` bounded optimism burn under the historical registration-OFF default).
+        assert_eq!(
+            r.audit.failed_into_parked, 0,
+            "registered parkers never draw engine-rejected intents: {} of {}",
             r.audit.failed_into_parked, r.audit.intents_issued
         );
     }

@@ -10,6 +10,7 @@
 //! Host-only; it reuses the `screeps-sim-core` kernel (no re-ported physics) and rover's own
 //! `LocalPathfinder` + `room_grid_dijkstra` (no one-off search algorithms — pricing policy only).
 
+pub mod annotate;
 pub mod base_traffic;
 pub mod cost;
 pub mod crowd;

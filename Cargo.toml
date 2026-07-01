@@ -19,6 +19,10 @@ screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }
 # fixtures (`terrain_import::fixtures`) + the verified column-major terrain decoder. The C-family
 # base-traffic scenarios plan foreman bases over these fixtures via the `capture_layout` bin.
 screeps-combat-eval = { git = "https://github.com/Azaril/screeps-combat-eval" }
+# The §D5.4 decision-(5) bridge (annotate.rs): the REAL force-sizing / objective-value kernels that
+# pre-price GoalAnnotations — the ONE sanctioned meeting point of the movement bench and the combat
+# stack (harness layer; value.rs itself stays combat-dep-free). Redirected by the root [patch].
+screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
 # The foreman room planner (offline, SLOW — ~4–60s/room) — run ONCE by the `capture_layout` bin to
 # plan realistic bases (incl. the roads/containers/storage combat-eval's `CapturedBase` drops) into
 # the committed `resources/captured-layouts.json` cache; never planned at test time.

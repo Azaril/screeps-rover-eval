@@ -68,8 +68,10 @@ pub const UPGRADE_POWER_E_T: f64 = 1.0;
 //      (claim hazard smoothing: a claimer inside 100 ticks of its deadline prices as if at 100 —
 //      caps the 1/slack explosion), `EPSILON_INTEL` = a 1×MOVE scout's upkeep (50/1500 e/t — VOI
 //      has no landed kernel; a declared floor, not a buried magic number), `V_SINK = 1.0` (build
-//      and upgrade energy both count at par until a sink-value kernel lands). Sensitivity sweep via
-//      the `tuning.rs` idiom is the follow-up.
+//      and upgrade energy both count at par until a sink-value kernel lands). The promised
+//      sensitivity sweep is LANDED: [`PolicyParams`] (Default == these constants, bit-for-bit) +
+//      `tuning.rs::sweep_policy_params` (env-driven, reports which points change quantized bid
+//      ORDER over the role-table fixture set — rank-affecting ranges, not raw deltas).
 //  (4) ttl plumbing — DECIDED scenario-supplied (an explicit `ttl` parameter): zero `SimCreep` /
 //      kernel schema change; the harness owns lifetimes like it owns terrain.
 //  (5) Economic-facts bridge — DECIDED pre-priced in [`GoalAnnotation`] (the ObjectiveIntel
@@ -87,8 +89,9 @@ pub const UPGRADE_POWER_E_T: f64 = 1.0;
 //      (the same gate that held back `StuckThresholds` in M5).
 // (10) Multi-room T*/ttr — DECIDED the approximation is accepted; `w` consumes `ttr` opaquely, so
 //      the parallel multi-room T* work lands without touching this module.
-// (11) H reporting — DECIDED per-family H primary + pooled secondary; wiring into `stats.rs` /
-//      `tuning.rs` reports is the follow-up (this module only defines the (value, weight) samples).
+// (11) H reporting — DECIDED per-family H primary + pooled secondary; LANDED in `tuning.rs`
+//      (`TuneScenario::family` → `TuneScore::per_family` + `family_report`; the pooled H stays
+//      the ranked key — this module only defines the (value, weight) samples).
 //
 // Implementation-detail defaults (documented so a veto knows what it is vetoing):
 //  - U decay shape: past the binding window, `U = max(floor_ratio, 1/(1 + excess/T_RAMP))` —
@@ -120,6 +123,35 @@ pub const CLAIM_ARRIVAL_MARGIN: u32 = 100;
 pub const EPSILON_INTEL_E_T: f64 = 50.0 / CREEP_LIFE_TIME as f64;
 /// Sink-value multiplier for worker energy — decision (3): build/upgrade energy at par (1.0).
 pub const V_SINK: f64 = 1.0;
+
+/// The decision-(3) policy constants as a swappable bundle — the sensitivity-sweep handle the
+/// decision block promises ("ship defaults + sensitivity sweep"). `Default` IS the decided
+/// constants above, bit-for-bit, so [`movement_intent_weight`] (which delegates with `Default`)
+/// is byte-unchanged; the sweep (`tuning.rs::sweep_policy_params`) probes off-default points via
+/// [`movement_intent_weight_with`] and reports which ranges actually CHANGE quantized bid order —
+/// the evidence an operator veto of decision (3) would be priced against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolicyParams {
+    /// A-gate ramp width + the U-gate decay scale (ticks) — [`T_RAMP`].
+    pub t_ramp: f64,
+    /// Claim hazard-smoothing reference slack (ticks) — [`S_REF`].
+    pub s_ref: f64,
+    /// Scout intel floor (e/t) — [`EPSILON_INTEL_E_T`].
+    pub epsilon_intel: f64,
+    /// Worker sink-value multiplier — [`V_SINK`].
+    pub v_sink: f64,
+}
+
+impl Default for PolicyParams {
+    fn default() -> Self {
+        PolicyParams {
+            t_ramp: T_RAMP,
+            s_ref: S_REF,
+            epsilon_intel: EPSILON_INTEL_E_T,
+            v_sink: V_SINK,
+        }
+    }
+}
 
 /// What a WORK part converts per tick, by job — selects the §D5.4 worker `k`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +345,12 @@ pub fn squad_sample_weight(creep: &SimCreep, role: &Role, squad: &SquadRef) -> f
 /// no longer arrive alive-and-useful has `w = 0`; ramped, not stepped, to avoid the binary-P(win)
 /// cliff. Exactly 0 when `ttl ≤ ttr + t_min` (the property-test boundary).
 pub fn gate_a(ttl: u32, ttr: u32, t_min: u32) -> f64 {
-    ((ttl as f64 - ttr as f64 - t_min as f64) / T_RAMP).clamp(0.0, 1.0)
+    gate_a_with(&PolicyParams::default(), ttl, ttr, t_min)
+}
+
+/// [`gate_a`] under explicit [`PolicyParams`] (the sensitivity-sweep entry).
+pub fn gate_a_with(params: &PolicyParams, ttl: u32, ttr: u32, t_min: u32) -> f64 {
+    ((ttl as f64 - ttr as f64 - t_min as f64) / params.t_ramp).clamp(0.0, 1.0)
 }
 
 /// S — the survival veto (kite.rs:704-714 generalized): `net_incoming × SURVIVAL_HORIZON ≥ hits`
@@ -338,6 +375,19 @@ pub fn gate_s(threat: Option<&ThreatView>, effective_hits: u32) -> f64 {
 /// floor `min(1, upkeep/r)` (decision (2): never 0 — an alive body is depreciating capital). A
 /// member already bidding the upkeep floor gets `floor_ratio == 1` ⇒ `U == 1` (no double-flooring).
 pub fn gate_u(role: &Role, creep: &SimCreep, ann: &GoalAnnotation, ttr: u32, ttl: u32, r: f64) -> f64 {
+    gate_u_with(&PolicyParams::default(), role, creep, ann, ttr, ttl, r)
+}
+
+/// [`gate_u`] under explicit [`PolicyParams`] (the decay scale is `t_ramp`).
+pub fn gate_u_with(
+    params: &PolicyParams,
+    role: &Role,
+    creep: &SimCreep,
+    ann: &GoalAnnotation,
+    ttr: u32,
+    ttl: u32,
+    r: f64,
+) -> f64 {
     let horizon_needed = match (role, &ann.squad) {
         (Role::Melee | Role::Ranged | Role::Heal | Role::Dismantle, Some(sq)) => {
             ann.t_min.saturating_add(sq.est_ticks)
@@ -350,7 +400,7 @@ pub fn gate_u(role: &Role, creep: &SimCreep, ann: &GoalAnnotation, ttr: u32, ttl
         return 1.0;
     }
     let excess = (window - horizon_needed) as f64;
-    let decay = 1.0 / (1.0 + excess / T_RAMP);
+    let decay = 1.0 / (1.0 + excess / params.t_ramp);
     let floor_ratio = (upkeep_e_t(&creep.body) / r).min(1.0);
     decay.max(floor_ratio)
 }
@@ -359,7 +409,7 @@ pub fn gate_u(role: &Role, creep: &SimCreep, ann: &GoalAnnotation, ttr: u32, ttl
 /// `ttr + CLAIM_ARRIVAL_MARGIN ≤ min(ttl, 600, deadline)` (the utility.rs:94 shape), then the
 /// hazard-smoothed stock rate `min(V, V/max(slack, S_REF))` — deadline-tight claimers explode in
 /// priority (capped at V), unreachable ones drop to exactly 0.
-fn claim_rate(ann: &GoalAnnotation, ttr: u32, ttl: u32) -> f64 {
+fn claim_rate(params: &PolicyParams, ann: &GoalAnnotation, ttr: u32, ttl: u32) -> f64 {
     let effective_deadline = ttl
         .min(CREEP_CLAIM_LIFE_TIME)
         .min(ann.deadline.unwrap_or(u32::MAX));
@@ -369,26 +419,33 @@ fn claim_rate(ann: &GoalAnnotation, ttr: u32, ttl: u32) -> f64 {
     };
     let slack = (effective_deadline - arrival) as f64; // ≥ 0: the gate passed
     let v = ann.value_stock_e;
-    v.min(v / slack.max(S_REF))
+    v.min(v / slack.max(params.s_ref))
 }
 
 /// The role's contention bid rate `r_bid` (e/t), before the external gates. The §D5.4 role table:
 /// haul = the pre-priced `Q/T*` (annotation); worker = `min(WORK·k, supply)·V_SINK` from the live
 /// body; scout = `max(ε_intel, upkeep)`; military = binding member bids the full `R_O`, everyone
 /// else (and any squadless straggler) the upkeep floor (decision (1)); claim = its own rail.
-fn progress_rate(creep: &SimCreep, role: &Role, ann: &GoalAnnotation, ttr: u32, ttl: u32) -> f64 {
+fn progress_rate(
+    params: &PolicyParams,
+    creep: &SimCreep,
+    role: &Role,
+    ann: &GoalAnnotation,
+    ttr: u32,
+    ttl: u32,
+) -> f64 {
     match role {
         Role::Haul { .. } => ann.rate_e_t,
         Role::Work { kind, supply_rate_e_t } => {
             let work = creep.body.alive_part_count(Part::Work) as f64;
-            (work * kind.energy_per_work_tick()).min(*supply_rate_e_t) * V_SINK
+            (work * kind.energy_per_work_tick()).min(*supply_rate_e_t) * params.v_sink
         }
-        Role::Scout => upkeep_e_t(&creep.body).max(EPSILON_INTEL_E_T),
+        Role::Scout => upkeep_e_t(&creep.body).max(params.epsilon_intel),
         Role::Melee | Role::Ranged | Role::Heal | Role::Dismantle => match &ann.squad {
             Some(sq) if sq.binding => sq.objective_rate(),
             _ => upkeep_e_t(&creep.body),
         },
-        Role::Claim => claim_rate(ann, ttr, ttl),
+        Role::Claim => claim_rate(params, ann, ttr, ttl),
     }
 }
 
@@ -422,13 +479,33 @@ pub fn movement_intent_weight(
     delta_crit: bool,
     threat: Option<&ThreatView>,
 ) -> f64 {
+    movement_intent_weight_with(&PolicyParams::default(), creep, role, ann, ttr, ttl, delta_crit, threat)
+}
+
+/// [`movement_intent_weight`] under explicit [`PolicyParams`] — the decision-(3) sensitivity-sweep
+/// entry point. The default-params path is bit-identical to [`movement_intent_weight`] (pinned by
+/// the smoke test); everything except the four policy constants is shared code.
+#[allow(clippy::too_many_arguments)] // the §D5.4 signature + one params handle; a struct would hide the contract
+pub fn movement_intent_weight_with(
+    params: &PolicyParams,
+    creep: &SimCreep,
+    role: &Role,
+    ann: &GoalAnnotation,
+    ttr: u32,
+    ttl: u32,
+    delta_crit: bool,
+    threat: Option<&ThreatView>,
+) -> f64 {
     let delta = if delta_crit { 1.0 } else { 0.0 };
     let s = gate_s(threat, creep.body.hits);
-    let r = progress_rate(creep, role, ann, ttr, ttl);
+    let r = progress_rate(params, creep, role, ann, ttr, ttl);
     let (a, u) = match role {
         // The reach gate inside the claim rail replaces A/U (§D5.4 role table, "its own rail").
         Role::Claim => (1.0, 1.0),
-        _ => (gate_a(ttl, ttr, ann.t_min), gate_u(role, creep, ann, ttr, ttl, r)),
+        _ => (
+            gate_a_with(params, ttl, ttr, ann.t_min),
+            gate_u_with(params, role, creep, ann, ttr, ttl, r),
+        ),
     };
     let w_progress = delta * a * s * u * r;
     // Escape is NOT Δ_crit-gated: fleeing is lateral by nature; any intent spent escaping bids the
@@ -649,6 +726,72 @@ mod tests {
         // The same body upgrading: k = 1 ⇒ WORK·k = 2 binds below the supply cap.
         let role_up = Role::Work { kind: WorkKind::Upgrade, supply_rate_e_t: 7.0 };
         assert_eq!(movement_intent_weight(&builder, &role_up, &ann, 10, 1500, true, None), 2.0);
+    }
+
+    /// Decision (3)'s sweep handle must be inert at its default: `PolicyParams::default()` IS the
+    /// decided constants (bit-equal), and the `_with` path reproduces `movement_intent_weight`
+    /// bit-for-bit across every role rail (so the sweep probes ONLY what it claims to probe).
+    #[test]
+    fn default_policy_params_are_the_decided_constants_bit_for_bit() {
+        let p = PolicyParams::default();
+        assert_eq!(p.t_ramp.to_bits(), T_RAMP.to_bits());
+        assert_eq!(p.s_ref.to_bits(), S_REF.to_bits());
+        assert_eq!(p.epsilon_intel.to_bits(), EPSILON_INTEL_E_T.to_bits());
+        assert_eq!(p.v_sink.to_bits(), V_SINK.to_bits());
+
+        // One fixture per policy-touched rail: hauler (t_ramp via A), binding+slack-rich squad
+        // (t_ramp via U decay), claimer (s_ref), scout (epsilon_intel), worker (v_sink), escaper
+        // (no params — must still match).
+        type Case = (SimCreep, Role, GoalAnnotation, u32, u32, bool, Option<ThreatView>);
+        let lethal = ThreatView { net_incoming_per_tick: 400 };
+        let cases: Vec<Case> = vec![
+            (
+                creep(1, &[Part::Carry, Part::Carry, Part::Move]),
+                Role::Haul { q: 100 },
+                GoalAnnotation { rate_e_t: 2.0, t_min: 1, ..Default::default() },
+                200, 1500, true, None,
+            ),
+            (
+                creep(2, &[Part::Attack, Part::Move]),
+                Role::Melee,
+                GoalAnnotation { t_min: 50, squad: Some(squad(0.4, 60.0, 60.0, true)), ..Default::default() },
+                0, 1500, true, None, // slack-rich: exercises the U decay's t_ramp
+            ),
+            (
+                creep(3, &[Part::Claim, Part::Move]),
+                Role::Claim,
+                GoalAnnotation { value_stock_e: 5000.0, ..Default::default() },
+                500, 1500, true, None, // slack 0: exercises s_ref
+            ),
+            (
+                creep(4, &[Part::Move]),
+                Role::Scout,
+                GoalAnnotation::default(),
+                10, 1500, true, None,
+            ),
+            (
+                creep(5, &[Part::Work, Part::Work, Part::Carry, Part::Move]),
+                Role::Work { kind: WorkKind::Build, supply_rate_e_t: 7.0 },
+                GoalAnnotation::default(),
+                10, 1500, true, None,
+            ),
+            (
+                creep(6, &[Part::Attack, Part::Move]),
+                Role::Melee,
+                GoalAnnotation { value_stock_e: 3000.0, ..Default::default() },
+                100, 1000, true, Some(lethal),
+            ),
+        ];
+        for (c, role, ann, ttr, ttl, delta, threat) in &cases {
+            let w = movement_intent_weight(c, role, ann, *ttr, *ttl, *delta, threat.as_ref());
+            let w_with = movement_intent_weight_with(&p, c, role, ann, *ttr, *ttl, *delta, threat.as_ref());
+            assert_eq!(
+                w.to_bits(),
+                w_with.to_bits(),
+                "default-params `_with` must be bit-identical (creep {})",
+                c.id
+            );
+        }
     }
 
     #[test]

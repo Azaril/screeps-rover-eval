@@ -275,10 +275,9 @@ mod tests {
         }
     }
 
-    /// The two rooms whose double-staffed pocket route STARVES under rover's CURRENT resolver — a
-    /// real-layout reproduction of the known head-on/parked-intent pathology (the same mechanics
-    /// as the two intentionally-failing crowd.rs tube/swarm tests, under parallel investigation),
-    /// kept in the corpus as live repros rather than constructed away. The E13S29 trace (2026-07-01):
+    /// Rooms whose double-staffed pocket route starves under the current resolver — real-layout
+    /// repros of the head-on/parked-intent pathology, kept in the corpus rather than constructed
+    /// away. EMPTY since the fixes landed (the ledger below); the ratchet cuts both ways.
     /// HISTORY (kept as the ledger): `E13S29` + `E11N17` starved under the pre-tuning default
     /// (`reuse_path_length: 5`) — the route's two haulers met head-on each cycle in the 1-wide
     /// road corridor that is the container pocket's only cheap mouth; the outer hauler won every
@@ -297,8 +296,9 @@ mod tests {
     /// gates) on every room except the [`KNOWN_STARVED`] repros (ratcheted both ways: a healthy
     /// room that regresses fails, a starved room that heals fails until delisted), and the
     /// resulting `H` + CI + percentiles + failed-move classes are REPORTED via eprintln
-    /// (regression-tracked numbers, deliberately NOT gated: contention makes `H < 1` structural,
-    /// and failed-intent mechanics are under the parallel investigation).
+    /// (regression-tracked numbers, deliberately NOT gated here: contention makes `H < 1`
+    /// structural; the hard failed-intent gates live in the crowd/haul suites, and the pooled-H
+    /// floor lives in the tuning full-corpus ratchet).
     #[test]
     fn real_layout_fleet_completes_and_reports_baseline() {
         let layouts = captured_layouts();
