@@ -1,8 +1,11 @@
 //! CPU / algorithmic bench for the rover mover (ADR 0033 §D5.3 / M5-rest): **op-counted primary,
 //! wall-clock secondary**. The primary signal is rover's own [`MovementTickStats`] —
-//! `ops_consumed` (pathfinding ops, 1 op ≈ 0.001 CPU live) + `repaths` per `process()` — read via
-//! `MovementSystem::tick_stats()`, the deterministic currency the scaling curves and gates are
-//! pinned in. Wall clock is measured too but only ever gated with LOOSE death-spiral bounds
+//! `ops_consumed` (pathfinding ops, 1 op ≈ 0.001 CPU live) + `repaths` per `process()` — surfaced
+//! through the kernel driver's stats variant
+//! ([`screeps_sim_core::resolve_moves_via_system_stats`], slice 7; this module's historical local
+//! mirror driver deleted itself when that seam landed), the deterministic currency the scaling
+//! curves and gates are pinned in. Wall clock is measured too but only ever gated with LOOSE
+//! death-spiral bounds
 //! (never tight thresholds, no criterion — the repo's hand-rolled `Instant`-loop convention,
 //! `screeps-combat-eval/src/bench.rs`): **native host wall-clock is a RELATIVE proxy for Screeps
 //! CPU** (wasm differs; there is no game CPU meter offline). What the loose bound catches is the
@@ -32,8 +35,10 @@
 //!   ([`crate::crowd::IntentAudit`]) counts something stronger: the **issued-vs-executed
 //!   reconciliation** — every `Direction` rover issued that the engine did not execute ("intent
 //!   spent, no action"), partitioned `failed_fatigued` / `failed_wall` / `failed_into_parked` /
-//!   `failed_coordination` by walking the blocking chain. Three gaps the live counter should
-//!   adopt (bot-side change — another lane; recorded as a follow-up, NOT edited here):
+//!   `failed_coordination` by walking the blocking chain. Gap (1) below LANDED live in slice 7
+//!   (seg-57 `pathing.wasted_moves` = the issued-vs-moved reconciliation via the CreepHandle
+//!   wrapper seam; `move_failures` KEPT as the self-reported give-up level for comparison).
+//!   The remaining gaps (2)/(3) stand as recorded:
 //!   (1) an engine-rejected intent is INVISIBLE live until the creep accrues 10 consecutive
 //!   immobile ticks — one-off rejections and the avoidable `failed_fatigued` burn never surface;
 //!   the live analogue of the offline sentinel is a cheap issued-vs-moved check (position
@@ -46,18 +51,11 @@
 
 use crate::cost::WorldCostSource;
 use crate::crowd::CrowdCreep;
-use screeps::{Direction, Part, Position};
-use screeps_rover::traits::CreepHandle;
-use screeps_rover::{
-    CostMatrixCache, CostMatrixSystem, CreepMovementData, LocalPathfinder, MovementData,
-    MovementError, MovementSystem, MovementSystemExternal, MovementTickStats,
-};
+use screeps::{Part, Position};
 use screeps_sim_core::{
-    resolve_movement, MoveIntents, MovementState, MoverConfig, SimBody, SimCreep, SimTerrain,
+    resolve_movement, resolve_moves_via_system_stats, MoveIntents, MovementState, MoverConfig,
+    SimBody, SimCreep, SimMoveCache, SimMoveRequest, SimTerrain,
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// One bench run's accounting: op-counted primary, wall-clock secondary.
@@ -70,11 +68,10 @@ pub struct OpsRun {
     pub intents_issued: u64,
     /// Σ `MovementTickStats::ops_consumed` — the op-counted PRIMARY (deterministic).
     pub ops_consumed: u64,
-    /// Σ `MovementTickStats::repaths`. NOTE the field is really a SEARCH counter: rover
-    /// increments it on every `generate_path` — first-time paths and segment re-searches
-    /// included (`movementsystem.rs:1237`), despite the rover-side field doc claiming
-    /// "first-time paths are not repaths" (a doc bug, flagged upstream). So `ops_consumed /
-    /// repaths` ≈ ops per search.
+    /// Σ `MovementTickStats::repaths` — really a SEARCH counter: rover increments it on every
+    /// successful `generate_path`, first-time paths and segment re-searches included (the
+    /// rover-side field doc now says exactly this — the doc bug this module flagged was fixed
+    /// upstream, slice 7). So `ops_consumed / repaths` ≈ ops per search.
     pub repaths: u64,
     /// The configured per-tick ops budget the run held (`MoverConfig::pathfinding_ops_budget`).
     pub ops_budget_cap: u32,
@@ -93,137 +90,6 @@ impl OpsRun {
     pub fn us_per_creep_tick(&self) -> f64 {
         self.elapsed.as_secs_f64() * 1e6 / (self.creeps as f64 * self.ticks.max(1) as f64)
     }
-}
-
-/// The move sink + handle glue, mirroring `sim_core::rover_driver` (its `SimCreepHandle`).
-type MoveSink = Rc<RefCell<HashMap<u32, Direction>>>;
-
-struct BenchCreepHandle {
-    id: u32,
-    pos: Position,
-    fatigue: u32,
-    sink: MoveSink,
-}
-
-impl CreepHandle for BenchCreepHandle {
-    fn pos(&self) -> Position {
-        self.pos
-    }
-    fn fatigue(&self) -> u32 {
-        self.fatigue
-    }
-    fn spawning(&self) -> bool {
-        false
-    }
-    fn move_direction(&self, dir: Direction) -> Result<(), String> {
-        self.sink.borrow_mut().insert(self.id, dir);
-        Ok(())
-    }
-    fn pull(&self, _other: &Self) -> Result<(), String> {
-        Ok(())
-    }
-    fn move_pulled_by(&self, _other: &Self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-struct BenchExternal<'w, 'c> {
-    movement: &'w MovementState,
-    sink: MoveSink,
-    cache: &'c mut HashMap<u32, CreepMovementData>,
-}
-
-impl MovementSystemExternal<u32> for BenchExternal<'_, '_> {
-    type Creep = BenchCreepHandle;
-
-    fn get_creep(&self, entity: u32) -> Result<BenchCreepHandle, MovementError> {
-        let c = self
-            .movement
-            .creeps
-            .iter()
-            .find(|c| c.id == entity && c.is_alive())
-            .ok_or_else(|| "creep not found".to_owned())?;
-        Ok(BenchCreepHandle { id: entity, pos: c.pos, fatigue: c.fatigue, sink: self.sink.clone() })
-    }
-
-    fn get_creep_movement_data(&mut self, entity: u32) -> Result<&mut CreepMovementData, MovementError> {
-        Ok(self.cache.entry(entity).or_default())
-    }
-
-    fn get_entity_position(&self, entity: u32) -> Option<Position> {
-        self.movement
-            .creeps
-            .iter()
-            .find(|c| c.id == entity && c.is_alive())
-            .map(|c| c.pos)
-    }
-}
-
-/// One resolver tick WITH the telemetry: a local mirror of
-/// [`screeps_sim_core::resolve_moves_via_system_with`] (same `MovementSystem` construction, same
-/// config wiring, same unlimited offline budgets, same owner-scoped Handle-sorted parked-creep
-/// registration) that additionally returns [`MovementTickStats`]. It exists ONLY because the
-/// kernel driver constructs its `MovementSystem` internally and drops it before `tick_stats()`
-/// can be read — surfacing the stats through the kernel driver (so this mirror deletes itself) is
-/// the recorded M5-rest follow-up, owned in sim-core's lane. Any behavioral change to the kernel
-/// driver must be mirrored here (the ops-determinism pin below catches drift in the numbers).
-fn resolve_with_stats(
-    world: &MovementState,
-    goals: &[(u32, Position, u32)],
-    cache: &mut HashMap<u32, CreepMovementData>,
-    cost_source: WorldCostSource,
-    config: &MoverConfig,
-) -> (HashMap<u32, Direction>, MovementTickStats) {
-    let sink: MoveSink = Rc::new(RefCell::new(HashMap::new()));
-    let mut external = BenchExternal { movement: world, sink: sink.clone(), cache };
-
-    let mut cm_cache = CostMatrixCache::default();
-    let mut cms = CostMatrixSystem::new(&mut cm_cache, Box::new(cost_source));
-    let mut pf = LocalPathfinder;
-    let mut system = MovementSystem::new(&mut cms, &mut pf, None);
-    system.set_max_shove_depth(config.max_shove_depth);
-    system.set_reuse_path_length(config.reuse_path_length);
-    system.set_pathfinding_ops_budget(config.pathfinding_ops_budget);
-    system.set_friendly_creep_distance(config.friendly_creep_distance);
-    system.set_stuck_thresholds(config.stuck_thresholds.clone());
-    // Offline contract (the kernel driver's stated one): budgets None-or-unlimited, work bounded
-    // deterministically by the ops budget alone.
-    system.set_cpu_budget(|| 0.0, f64::MAX);
-    system.set_repath_budget(|| 0.0, f64::MAX);
-
-    if config.register_idle_creeps {
-        let requested: std::collections::HashSet<u32> = goals.iter().map(|&(id, _, _)| id).collect();
-        let owners: std::collections::HashSet<_> = world
-            .creeps
-            .iter()
-            .filter(|c| requested.contains(&c.id))
-            .map(|c| c.owner)
-            .collect();
-        let mut parked: Vec<(u32, Position)> = world
-            .creeps
-            .iter()
-            .filter(|c| c.is_alive() && !requested.contains(&c.id) && owners.contains(&c.owner))
-            .map(|c| (c.id, c.pos))
-            .collect();
-        parked.sort_unstable_by_key(|(id, _)| *id);
-        let mut idle: HashMap<Position, u32> = HashMap::new();
-        for (id, pos) in parked {
-            idle.entry(pos).or_insert(id);
-        }
-        system.set_idle_creep_positions(idle);
-    }
-
-    let mut data = MovementData::new();
-    for &(id, target, range) in goals {
-        data.move_to(id, target).range(range);
-    }
-    let _ = system.process(&mut external, data);
-    let stats = system.tick_stats();
-
-    drop(system);
-    drop(external);
-    let dirs = Rc::try_unwrap(sink).map(|c| c.into_inner()).unwrap_or_default();
-    (dirs, stats)
 }
 
 /// Drive `creeps` to their goals through the real mover (crowd-shaped loop: arrived creeps park
@@ -256,7 +122,7 @@ pub fn run_ops_bench(
     let goals: Vec<(Position, u32)> = creeps.iter().map(|c| (c.goal, c.range)).collect();
     let within = |p: Position, i: usize| p.get_range_to(goals[i].0) <= goals[i].1;
 
-    let mut cache: HashMap<u32, CreepMovementData> = HashMap::new();
+    let mut cache = SimMoveCache::new();
     let mut run = OpsRun {
         creeps: n,
         ticks: 0,
@@ -274,12 +140,21 @@ pub fn run_ops_bench(
         if (0..n).all(|i| within(world.creeps[i].pos, i)) {
             break;
         }
-        let reqs: Vec<(u32, Position, u32)> = (0..n)
+        // Kernel-driver requests: `move_to` defaults (Normal priority, shove+swap consent) are
+        // exactly what the deleted mirror's bare `data.move_to(id, target).range(range)` carried
+        // (rover's `MovementRequest` defaults), so the rewire is behavior-identical — the
+        // ops-determinism pin below and the re-run scaling curves vouch for it in the numbers.
+        let reqs: Vec<SimMoveRequest> = (0..n)
             .filter(|&i| !within(world.creeps[i].pos, i))
-            .map(|i| (world.creeps[i].id, goals[i].0, goals[i].1))
+            .map(|i| SimMoveRequest::move_to(world.creeps[i].id, goals[i].0, goals[i].1))
             .collect();
-        let (dirs, stats) =
-            resolve_with_stats(&world, &reqs, &mut cache, WorldCostSource::new(terrain, &world), config);
+        let (dirs, stats) = resolve_moves_via_system_stats(
+            &world,
+            &reqs,
+            &mut cache,
+            WorldCostSource::new(terrain, &world),
+            config,
+        );
         run.intents_issued += dirs.len() as u64;
         run.ops_consumed += stats.ops_consumed as u64;
         run.repaths += stats.repaths as u64;
@@ -374,9 +249,9 @@ mod tests {
     use super::*;
 
     /// §D5.1(f) single-creep ops gates (checked-in): a lone creep's route consumes REAL, bounded
-    /// ops — > 0 (the counter is actually wired end-to-end through this bench's mirror driver)
-    /// and never over the per-tick cap on ANY tick (the L4 invariant: the budget is enforced,
-    /// not advisory). Exact ops printed for the record.
+    /// ops — > 0 (the counter is actually wired end-to-end through the kernel driver's stats
+    /// seam, `resolve_moves_via_system_stats`) and never over the per-tick cap on ANY tick (the
+    /// L4 invariant: the budget is enforced, not advisory). Exact ops printed for the record.
     #[test]
     fn single_creep_ops_are_wired_and_capped() {
         let (terrain, creeps) = parallel_lanes(1);
@@ -397,9 +272,9 @@ mod tests {
     }
 
     /// The ops accounting is bit-deterministic (the determinism fence extended to the CPU lane):
-    /// same world + config ⇒ identical ops, repaths, intents, ticks. Also pins the bench mirror
-    /// against kernel-driver drift — if `resolve_with_stats` and the kernel driver diverge
-    /// behaviorally, congestion resolution changes and these integers move.
+    /// same world + config ⇒ identical ops, repaths, intents, ticks. Runs on the kernel driver
+    /// itself since slice 7 (the historical bench mirror deleted itself when the stats seam
+    /// landed) — a behavioral change to the driver moves these integers.
     #[test]
     fn ops_accounting_is_deterministic() {
         let (terrain, creeps) = shared_pinch(8);
