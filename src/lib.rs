@@ -12,6 +12,7 @@
 
 pub mod annotate;
 pub mod base_traffic;
+pub mod bench;
 pub mod cost;
 pub mod crowd;
 pub mod haul;

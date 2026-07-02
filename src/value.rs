@@ -15,8 +15,8 @@
 //! integer milli-e/t (+ a stable-id tie-break) before any ordering, per the determinism fence.
 //!
 //! **Scope:** the hauler arm (the operator's "maximum value transport by distance" anchor) plus the
-//! MILITARY / worker / claimer / scout arms — the §D5.4 role table in full, with the 11 open
-//! decisions resolved to defaults-pending-operator-veto (the `## §D5.4 decisions` block below).
+//! MILITARY / worker / claimer / scout arms — the §D5.4 role table in full, with the 11 decisions
+//! RATIFIED 2026-07-01 under live-constant alignment (the `## §D5.4 decisions` block below).
 //! Entry point: [`movement_intent_weight`]; squad benchmark weights: [`squad_sample_weight`].
 
 use screeps::Part;
@@ -51,9 +51,12 @@ pub const BUILD_POWER_E_T: f64 = 5.0;
 pub const UPGRADE_POWER_E_T: f64 = 1.0;
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// ## §D5.4 decisions — the 11 open items (ADR 0033 §D5.4 "Open decisions"), resolved to the
-// synthesis-recommended DEFAULTS. Each is DECIDED-pending-operator-veto; vetoing any is a constant
-// or match-arm change, never a schema change.
+// ## §D5.4 decisions — RATIFIED (2026-07-01, operator). The 11 items (ADR 0033 §D5.4 "Open
+// decisions") stand as written below, with LIVE-CONSTANT ALIGNMENT applied at ratification:
+// `CLAIM_ARRIVAL_MARGIN` 100→50 (the live margin, screeps-ibex/src/missions/utility.rs:66) and the
+// S-veto comparison ≥→strict `>` (the live kite.rs:713) — noted on decisions (3)/(8) and in the
+// implementation-detail defaults list. Any future change remains a constant or match-arm change,
+// never a schema change.
 //
 //  (1) Squad bid semantics — DECIDED binding-member-bids-`R_O` for CONTENTION, cost-shares
 //      (`α_class·s_member`) for SAMPLE weights. The critical-path laggard delays the WHOLE
@@ -71,7 +74,9 @@ pub const UPGRADE_POWER_E_T: f64 = 1.0;
 //      and upgrade energy both count at par until a sink-value kernel lands). The promised
 //      sensitivity sweep is LANDED: [`PolicyParams`] (Default == these constants, bit-for-bit) +
 //      `tuning.rs::sweep_policy_params` (env-driven, reports which points change quantized bid
-//      ORDER over the role-table fixture set — rank-affecting ranges, not raw deltas).
+//      ORDER over the role-table fixture set — rank-affecting ranges, not raw deltas). RATIFIED
+//      as proposed, plus one alignment outside the four sweep constants: the claimer arrival
+//      margin drops to the LIVE 50 (utility.rs:66) — see the defaults list below.
 //  (4) ttl plumbing — DECIDED scenario-supplied (an explicit `ttl` parameter): zero `SimCreep` /
 //      kernel schema change; the harness owns lifetimes like it owns terrain.
 //  (5) Economic-facts bridge — DECIDED pre-priced in [`GoalAnnotation`] (the ObjectiveIntel
@@ -84,6 +89,9 @@ pub const UPGRADE_POWER_E_T: f64 = 1.0;
 //  (8) Escape bid — DECIDED `w = max(w_progress, w_escape)` (one intent does one or the other —
 //      summing would double-bid a single tile), with the wounded discount `V·hits/hits_max` (a
 //      nearly-dead creep's remaining stock has already been destroyed; don't over-bid saving it).
+//      RATIFIED with the S-veto handoff aligned to the live STRICT `>` (kite.rs:713): the veto —
+//      and thus the escape takeover — fires only when net×horizon strictly exceeds hits; the
+//      exact-lethal boundary now survives, matching live.
 //  (9) Runtime adoption — DECIDED benchmark-only for now: replacing rover's High/Normal/Low
 //      resolver priority with quantized `w` is the follow-up, gated on a combat-corpus tournament
 //      (the same gate that held back `StuckThresholds` in M5).
@@ -102,11 +110,12 @@ pub const UPGRADE_POWER_E_T: f64 = 1.0;
 //    reduction exact).
 //  - Military horizon_needed = `t_min + est_ticks` (arrive + fight): the window binds while the
 //    creep cannot both reach and serve out the objective with room to spare.
-//  - S-veto comparison is `≥` (boundary counts as lethal — conservative offline), a deliberate
-//    one-ulp tightening of the live strict `>` at combat-decision/src/kite.rs:713.
-//  - `CLAIM_ARRIVAL_MARGIN = 100` doubles the live 50 (screeps-ibex/src/missions/utility.rs:66):
-//    the live margin covers only the claim-intent latency; the bench adds arrival-positioning
-//    slack under contention. Operator may veto back to 50 for live parity.
+//  - S-veto comparison is the live STRICT `>` (combat-decision/src/kite.rs:713): exactly-lethal
+//    (`net × SURVIVAL_HORIZON == hits`) SURVIVES. Ratified 2026-07-01 — the pre-ratification
+//    one-ulp `≥` tightening is dropped for live parity.
+//  - `CLAIM_ARRIVAL_MARGIN = 50` == the live margin (screeps-ibex/src/missions/utility.rs:66, the
+//    claim-intent latency). Ratified 2026-07-01 — the pre-ratification 2× bench margin (100,
+//    arrival-positioning slack under contention) is dropped for live parity.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 
 /// A-gate ramp width (ticks) — decision (3). `A = clamp((ttl − ttr − t_min)/T_RAMP, 0, 1)`.
@@ -116,8 +125,9 @@ pub const S_REF: f64 = 100.0;
 /// Survival-veto horizon (ticks) — combat-decision/src/kite.rs:24 (ADR 0019 Guard 4), generalized:
 /// progress you don't survive to convert is not progress (kite.rs:704-714).
 pub const SURVIVAL_HORIZON: u32 = 3;
-/// Claimer arrival margin (ticks) — decision default 100 (2× live utility.rs:66; see the block above).
-pub const CLAIM_ARRIVAL_MARGIN: u32 = 100;
+/// Claimer arrival margin (ticks) — ratified 2026-07-01 to the LIVE 50
+/// (screeps-ibex/src/missions/utility.rs:66; see the decisions block above).
+pub const CLAIM_ARRIVAL_MARGIN: u32 = 50;
 /// Scout intel floor (e/t) — decision (3): a 1×MOVE scout's amortized upkeep. A declared policy
 /// constant standing in for a value-of-information kernel that does not exist yet.
 pub const EPSILON_INTEL_E_T: f64 = 50.0 / CREEP_LIFE_TIME as f64;
@@ -353,14 +363,15 @@ pub fn gate_a_with(params: &PolicyParams, ttl: u32, ttr: u32, t_min: u32) -> f64
     ((ttl as f64 - ttr as f64 - t_min as f64) / params.t_ramp).clamp(0.0, 1.0)
 }
 
-/// S — the survival veto (kite.rs:704-714 generalized): `net_incoming × SURVIVAL_HORIZON ≥ hits`
-/// ⇒ 0 (progress you don't survive to convert is not progress; the escape bid takes over). `≥`,
-/// not the live strict `>` — see the decisions block. No threat view ⇒ 1.
+/// S — the survival veto (kite.rs:704-714 generalized): `net_incoming × SURVIVAL_HORIZON > hits`
+/// ⇒ 0 (progress you don't survive to convert is not progress; the escape bid takes over). The
+/// LIVE strict `>` of kite.rs:713 (ratified 2026-07-01): exactly-lethal survives — see the
+/// decisions block. No threat view ⇒ 1.
 pub fn gate_s(threat: Option<&ThreatView>, effective_hits: u32) -> f64 {
     match threat {
         Some(t)
             if t.net_incoming_per_tick > 0
-                && t.net_incoming_per_tick.saturating_mul(SURVIVAL_HORIZON) >= effective_hits =>
+                && t.net_incoming_per_tick.saturating_mul(SURVIVAL_HORIZON) > effective_hits =>
         {
             0.0
         }
@@ -666,14 +677,20 @@ mod tests {
 
     #[test]
     fn s_veto_zeroes_progress_under_lethal_incoming_and_escape_takes_over() {
-        // 10 parts ⇒ 1000 hits. net 334: 334×3 = 1002 ≥ 1000 ⇒ lethal (the ≥ boundary); net 333:
-        // 999 < 1000 ⇒ survives.
+        // 10 parts ⇒ 1000 hits. The LIVE strict `>` boundary (kite.rs:713, ratified 2026-07-01):
+        // net 334: 334×3 = 1002 > 1000 ⇒ lethal; net 333: 999 not > 1000 ⇒ survives.
         let body: Vec<Part> = std::iter::repeat_n(Part::Attack, 9).chain([Part::Move]).collect();
         let melee = creep(1, &body);
         let lethal = ThreatView { net_incoming_per_tick: 334 };
         let survivable = ThreatView { net_incoming_per_tick: 333 };
         assert_eq!(gate_s(Some(&lethal), melee.body.hits), 0.0);
         assert_eq!(gate_s(Some(&survivable), melee.body.hits), 1.0);
+        // The strict boundary pinned at EXACT equality: 3 parts ⇒ 300 hits, net 100 ⇒ 100×3 == 300
+        // — not strictly greater ⇒ SURVIVES (live parity; `≥` would have vetoed); one more point
+        // of net (101×3 = 303 > 300) flips it lethal.
+        let boundary = creep(2, &[Part::Attack, Part::Attack, Part::Move]);
+        assert_eq!(gate_s(Some(&ThreatView { net_incoming_per_tick: 100 }), boundary.body.hits), 1.0);
+        assert_eq!(gate_s(Some(&ThreatView { net_incoming_per_tick: 101 }), boundary.body.hits), 0.0);
 
         // No stock aboard ⇒ no escape surplus ⇒ w == 0 under lethal fire: pure veto.
         let ann = GoalAnnotation { t_min: 50, squad: Some(squad(1.0, 270.0, 270.0, true)), ..Default::default() };
@@ -697,17 +714,18 @@ mod tests {
     #[test]
     fn claimer_reach_gate_is_exact_at_the_boundary() {
         let claimer = creep(1, &[Part::Claim, Part::Move]);
-        // ttl 1500 caps at CREEP_CLAIM_LIFE_TIME 600: ttr 500 + margin 100 == 600 ⇒ passes, slack 0
-        // ⇒ w = min(V, V/max(0, S_REF)) = 5000/100 = 50.
+        // ttl 1500 caps at CREEP_CLAIM_LIFE_TIME 600: ttr 550 + margin 50 (the LIVE utility.rs:66
+        // margin, ratified 2026-07-01) == 600 ⇒ passes, slack 0 ⇒ w = min(V, V/max(0, S_REF)) =
+        // 5000/100 = 50.
         let ann = GoalAnnotation { value_stock_e: 5000.0, ..Default::default() };
-        let w = movement_intent_weight(&claimer, &Role::Claim, &ann, 500, 1500, true, None);
+        let w = movement_intent_weight(&claimer, &Role::Claim, &ann, 550, 1500, true, None);
         assert_eq!(w, 50.0, "at the exact boundary the claimer still bids (hazard-smoothed)");
         // One tick past ⇒ the hard gate drops it to exactly 0.
-        assert_eq!(movement_intent_weight(&claimer, &Role::Claim, &ann, 501, 1500, true, None), 0.0);
-        // An external deadline tightens the window below the 600 lifetime.
+        assert_eq!(movement_intent_weight(&claimer, &Role::Claim, &ann, 551, 1500, true, None), 0.0);
+        // An external deadline tightens the window below the 600 lifetime: ttr + 50 ≤ 550.
         let ann_dl = GoalAnnotation { deadline: Some(550), ..ann.clone() };
-        assert!(movement_intent_weight(&claimer, &Role::Claim, &ann_dl, 450, 1500, true, None) > 0.0);
-        assert_eq!(movement_intent_weight(&claimer, &Role::Claim, &ann_dl, 451, 1500, true, None), 0.0);
+        assert!(movement_intent_weight(&claimer, &Role::Claim, &ann_dl, 500, 1500, true, None) > 0.0);
+        assert_eq!(movement_intent_weight(&claimer, &Role::Claim, &ann_dl, 501, 1500, true, None), 0.0);
     }
 
     #[test]
@@ -761,7 +779,7 @@ mod tests {
                 creep(3, &[Part::Claim, Part::Move]),
                 Role::Claim,
                 GoalAnnotation { value_stock_e: 5000.0, ..Default::default() },
-                500, 1500, true, None, // slack 0: exercises s_ref
+                550, 1500, true, None, // slack 0 (ttr 550 + the live margin 50 == 600): exercises s_ref
             ),
             (
                 creep(4, &[Part::Move]),

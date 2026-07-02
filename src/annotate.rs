@@ -63,9 +63,10 @@ pub struct SquadMemberInput {
 }
 
 /// The four military capability classes [`RequiredForce`] can demand of squad ROLES. Tough/Claim
-/// parts also exist on `RequiredForce` but have no movement Role here — their spawn cost still
-/// counts in the α denominator (below), so their share of `V_O` goes UNCLAIMED rather than being
-/// silently redistributed (conservative: a squad never integrates more than `V_O`).
+/// parts also exist on `RequiredForce` but have no movement Role here — their spawn cost counts in
+/// the α denominator (below) AND is REDISTRIBUTED to the members whose BODIES carry the parts
+/// (ratified 2026-07-01, operator: allocate to the carrier, body-based, no class guessing — see
+/// [`carried_share`]), so a fully-specified squad integrates `V_O` EXACTLY, no unclaimed remainder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
     Melee,
@@ -129,12 +130,60 @@ fn class_cost_e(required: &RequiredForce, class: Class) -> f64 {
 }
 
 /// The α denominator: total spawn cost of EVERYTHING the oracle demands — the four role classes plus
-/// the role-less Tough/Claim parts, so a drain comp's TOUGH buffer (force_sizing.rs:544) dilutes the
-/// role shares instead of vanishing (Σ α over ROLE classes ≤ 1, = 1 iff the force is all-role).
+/// the role-less Tough/Claim parts (Σ α over ROLE classes ≤ 1, = 1 iff the force is all-role). The
+/// Tough/Claim remainder does NOT vanish: [`carried_share`] hands it to the carrying bodies, so the
+/// squad's shares still sum to 1 when the force is fully fielded.
 fn total_required_cost_e(required: &RequiredForce) -> f64 {
     CLASSES.iter().map(|&c| class_cost_e(required, c)).sum::<f64>()
         + (required.tough_parts * Part::Tough.cost()) as f64
         + (required.claim_parts * Part::Claim.cost()) as f64
+}
+
+/// The two role-less CARRIER part kinds a `RequiredForce` can demand (tough buffer,
+/// force_sizing.rs:517; declaim weapon, force_sizing.rs:522).
+const CARRIER_PARTS: [Part; 2] = [Part::Tough, Part::Claim];
+
+fn required_carrier_parts(required: &RequiredForce, part: Part) -> u32 {
+    match part {
+        Part::Tough => required.tough_parts,
+        Part::Claim => required.claim_parts,
+        _ => 0,
+    }
+}
+
+/// Carrier parts on a member's BODY (total, not alive-only: spawn cost is sunk at spawn — the same
+/// basis as `value::body_cost_e`).
+fn carried_parts(body: &SimBody, part: Part) -> u32 {
+    body.parts.iter().filter(|p| p.part == part).count() as u32
+}
+
+/// The member's REDISTRIBUTED share of the role-less Tough/Claim spawn cost (ratified 2026-07-01,
+/// operator): each carrier kind contributes `(required_parts × cost / total_cost) ×
+/// (own_parts / max(required_parts, fielded_parts))` — the SAME renormalization shape as the role
+/// classes (overfill dilutes carriers; underfill leaves the shortfall unclaimed), keyed purely off
+/// the BODY (no class guessing: whoever spawned with the TOUGH plates owns their cost-share). With
+/// the α denominator unchanged (the full `RequiredForce` cost), a fully-fielded squad's shares —
+/// role classes + carriers — sum to exactly 1, so the sample weights integrate `V_O` exactly once.
+fn carried_share(
+    required: &RequiredForce,
+    body: &SimBody,
+    fielded_carrier: &[u32; 2],
+    total_cost: f64,
+) -> f64 {
+    if total_cost <= 0.0 {
+        return 0.0;
+    }
+    let mut share = 0.0;
+    for (k, &part) in CARRIER_PARTS.iter().enumerate() {
+        let req = required_carrier_parts(required, part);
+        let denom = req.max(fielded_carrier[k]);
+        let own = carried_parts(body, part);
+        if denom > 0 && own > 0 {
+            let cost_share = (req * part.cost()) as f64 / total_cost;
+            share += cost_share * (own as f64 / denom as f64);
+        }
+    }
+    share
 }
 
 /// Build the squad's per-member [`GoalAnnotation`]s from the objective's pre-priced facts + the
@@ -146,8 +195,10 @@ fn total_required_cost_e(required: &RequiredForce) -> f64 {
 /// fielded classmates (the over/under-fill renormalization denominator, value.rs `SquadRef` docs),
 /// `binding` = the first max-`ttr` member (the critical-path laggard, decision (1); first = the id
 /// tie-break under the caller's id-sorted order). `value_stock_e` is set to the member's cost-share
-/// of `V_O` — the SAME renormalized share [`crate::value::squad_sample_weight`] integrates — so the
-/// escape bid (decision (8)) prices exactly the objective share this member's death forfeits.
+/// of `V_O`: the class share [`crate::value::squad_sample_weight`] integrates PLUS the member's
+/// body-carried Tough/Claim redistribution ([`carried_share`], ratified 2026-07-01) — so the escape
+/// bid (decision (8)) prices exactly the objective share this member's death forfeits, and the
+/// squad's stocks sum to exactly `V_O` when fully fielded.
 ///
 /// A non-military member (a tag-along claimer/scout) gets a squadless annotation: it bids the
 /// upkeep floor through value.rs's role table, never a share of `V_O`.
@@ -157,11 +208,17 @@ pub fn annotate_squad(
     members: &[SquadMemberInput],
 ) -> Vec<GoalAnnotation> {
     let total_cost = total_required_cost_e(required);
-    // Fielded power per class — Σ over members, caller order (id-sorted ⇒ deterministic).
+    // Fielded power per class + fielded carrier parts — Σ over MILITARY members, caller order
+    // (id-sorted ⇒ deterministic). Non-military stragglers ride their own rail (below) and neither
+    // contribute to nor draw from the carrier redistribution.
     let mut fielded = [0.0f64; 4];
+    let mut fielded_carrier = [0u32; 2];
     for m in members {
         if let Some(class) = class_of(&m.role) {
             fielded[class as usize] += class_power(&m.role, &m.body);
+            for (k, &part) in CARRIER_PARTS.iter().enumerate() {
+                fielded_carrier[k] += carried_parts(&m.body, part);
+            }
         }
     }
     // The binding laggard: first max-ttr (strict `>` keeps the earliest, the id tie-break).
@@ -200,15 +257,19 @@ pub fn annotate_squad(
                 fielded_class_power: fielded[class as usize],
                 binding: i == binding_ix,
             };
-            // The member's cost-share of V_O — mirrors squad_sample_weight (value.rs:304) so the
-            // stock at risk == the sample weight the benchmark integrates for this member.
+            // The member's cost-share of V_O: the class share (mirrors squad_sample_weight,
+            // value.rs) + the body-carried Tough/Claim redistribution (ratified 2026-07-01) — the
+            // stock at risk == the full share this member's death forfeits, and Σ over a
+            // fully-fielded squad == V_O exactly (no unclaimed carrier remainder).
             let denom = squad.required_class_power.max(squad.fielded_class_power);
-            let value_stock_e = if denom > 0.0 {
+            let class_share = if denom > 0.0 {
                 squad.alpha_class * (class_power(&m.role, &m.body) / denom)
-                    * squad.objective_value_e()
             } else {
                 0.0
             };
+            let value_stock_e = (class_share
+                + carried_share(required, &m.body, &fielded_carrier, total_cost))
+                * squad.objective_value_e();
             GoalAnnotation {
                 rate_e_t: 0.0, // military is annotation-priced, not t_star-priced (value.rs role table)
                 value_stock_e,
@@ -329,6 +390,80 @@ mod tests {
             sum += w;
         }
         assert_eq!(sum, 30_000.0, "the quad integrates V_O exactly once (0.25+0.25+0.5+0 shares)");
+    }
+
+    /// (a′) TOUGH/CLAIM spawn-cost REDISTRIBUTION (ratified 2026-07-01, operator): the role-less
+    /// carrier cost goes to the member whose BODY carries the parts — body-based, no class
+    /// guessing — with the α denominator unchanged (the full `RequiredForce` cost), so the squad's
+    /// stocks integrate `V_O` EXACTLY (the pre-ratification behavior left the TOUGH share
+    /// permanently unclaimed). Dyadic fixture ⇒ assert_eq exact: required = 3 HEAL (750 e) +
+    /// 25 TOUGH (250 e), total 1000 e ⇒ shares 0.75 / 0.25 exact in f64.
+    #[test]
+    fn tough_carrier_tank_claims_exactly_the_tough_cost_share_and_squad_totals_v_o() {
+        let required = RequiredForce { heal_parts: 3, tough_parts: 25, ..Default::default() };
+        // V_O = 0.5 × 64_000 = 32_000 exact.
+        let facts = ObjectiveFacts { value_e: 64_000.0, p_win: 0.5, est_ticks: 800 };
+        // The tank: an ATTACK-armed TOUGH carrier. Its melee CLASS share is exactly 0 —
+        // `RequiredForce` has no ATTACK term (required_parts = 0 ⇒ α_melee = 0) — so its whole
+        // stock is the carried redistribution: the pre-ratification share was 0.
+        let tough_tank: Vec<Part> = std::iter::repeat_n(Part::Tough, 25)
+            .chain([Part::Attack, Part::Move])
+            .collect();
+        let members = [
+            member(Role::Heal, &[Part::Heal, Part::Heal, Part::Heal, Part::Move], 100),
+            member(Role::Melee, &tough_tank, 110),
+        ];
+        let anns = annotate_squad(&facts, &required, &members);
+
+        // The tank's class weight through squad_sample_weight is 0 (α_melee = 0)…
+        let tank = SimCreep { body: members[1].body.clone(), ..creep(2, &[]) };
+        let w_class = squad_sample_weight(&tank, &Role::Melee, anns[1].squad.as_ref().unwrap());
+        assert_eq!(w_class, 0.0, "melee has no RequiredForce term: the class share is 0");
+        // …so its stock GREW by exactly the TOUGH spawn-cost share: 25×10/1000 = 0.25 of V_O.
+        assert_eq!(
+            anns[1].value_stock_e,
+            w_class + 0.25 * 32_000.0,
+            "the carrier's share grew by exactly the TOUGH cost share (8000 e)"
+        );
+        // The non-carrier healer is untouched: stock == its class sample weight (0.75 · V_O).
+        let healer = SimCreep { body: members[0].body.clone(), ..creep(1, &[]) };
+        assert_eq!(
+            anns[0].value_stock_e,
+            squad_sample_weight(&healer, &Role::Heal, anns[0].squad.as_ref().unwrap()),
+        );
+        assert_eq!(anns[0].value_stock_e, 0.75 * 32_000.0);
+        // The exact-integration invariant: Σ stocks == V_O, no unclaimed carrier remainder.
+        assert_eq!(
+            anns[0].value_stock_e + anns[1].value_stock_e,
+            32_000.0,
+            "role shares + carried shares integrate V_O exactly once"
+        );
+    }
+
+    /// (a″) Carrier renormalization mirrors the class shape: OVERFILLED TOUGH (two tanks fielding
+    /// 2× the required plates) dilutes each carrier — the carrier pool still integrates exactly the
+    /// required TOUGH cost share, never more.
+    #[test]
+    fn overfilled_tough_carriers_dilute_but_never_exceed_the_carrier_share() {
+        let required = RequiredForce { heal_parts: 3, tough_parts: 25, ..Default::default() };
+        let facts = ObjectiveFacts { value_e: 64_000.0, p_win: 0.5, est_ticks: 800 };
+        let tough_tank: Vec<Part> = std::iter::repeat_n(Part::Tough, 25)
+            .chain([Part::Attack, Part::Move])
+            .collect();
+        let members = [
+            member(Role::Heal, &[Part::Heal, Part::Heal, Part::Heal, Part::Move], 100),
+            member(Role::Melee, &tough_tank, 110),
+            member(Role::Melee, &tough_tank, 120), // fielded 50 TOUGH vs required 25
+        ];
+        let anns = annotate_squad(&facts, &required, &members);
+        // Each tank: 0.25 × (25/max(25, 50)) = 0.125 of V_O — diluted, Σ carriers = 0.25 exactly.
+        assert_eq!(anns[1].value_stock_e, 0.125 * 32_000.0);
+        assert_eq!(anns[2].value_stock_e, 0.125 * 32_000.0);
+        assert_eq!(
+            anns[0].value_stock_e + anns[1].value_stock_e + anns[2].value_stock_e,
+            32_000.0,
+            "overfill dilutes carriers; the squad still integrates V_O exactly once"
+        );
     }
 
     /// (b) Contention semantics (decision (1)): the binding (max-ttr) member bids the full `R_O`

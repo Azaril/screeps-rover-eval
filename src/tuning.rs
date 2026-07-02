@@ -19,10 +19,11 @@
 //! shipped DEFAULT (operator directive), with this tournament as the recorded rationale.
 //!
 //! Two corpora: [`corpus`] (fast — 5 synthetics + 3 real rooms, what the checked-in tests run) and
-//! [`corpus_full`] (`TUNE_FULL_CORPUS=1` — all 13 real rooms + 2 multi-room border routes, priced
-//! by the solo-T* baseline, [`crate::haul::t_star_rtt_solo`]). Every score reports H **per scenario
-//! family** (synthetic / real / border — §D5.4 decision (11) primary view, [`family_report`]) on
-//! top of the pooled H that keys the ranking.
+//! [`corpus_full`] (`TUNE_FULL_CORPUS=1` — all 13 real rooms + 3 multi-room border routes
+//! including one HETEROGENEOUS pair, priced by the solo-T* baseline,
+//! [`crate::haul::t_star_rtt_solo`]). Every score reports H **per scenario family** (synthetic /
+//! real / border — §D5.4 decision (11) primary view, [`family_report`]) on top of the pooled H
+//! that keys the ranking.
 //!
 //! END-STATE RE-RUN 2026-07-01 (registration ON + denial-as-stuck + shoveable idles + the banked
 //! per-request `ladder(8)` + value triage — the shipped default stack; full corpus, escalation
@@ -41,12 +42,12 @@
 
 use crate::base_traffic::{base_scenario, captured_layouts, energy_traffic_fleet};
 pub use crate::haul::ladder;
-use crate::haul::{run_haul_fleet_opts, FleetOpts, HaulAssignment};
+use crate::haul::{run_haul_fleet_world, FleetOpts, HaulAssignment, HaulOutcome};
 use crate::stats::Summary;
 use crate::value::quantize_w;
 use screeps::{Position, RoomCoordinate, RoomName};
 use screeps_sim_core::{MoverConfig, SimBody, SimTerrain};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The scenario families H is reported per (§D5.4 decision (11): per-family PRIMARY, pooled
 /// secondary — a config that buys synthetic-pinch H by taxing the real rooms must be visible as
@@ -65,6 +66,10 @@ pub struct TuneScenario {
     /// so a renamed scenario cannot silently switch reporting pools.
     pub family: &'static str,
     pub terrain: SimTerrain,
+    /// Per-room terrain OVERRIDES ([`screeps_sim_core::MovementState::rooms`] semantics: a room
+    /// absent here is served `terrain` — mirrored). Empty for every single-room scenario; the
+    /// heterogeneous border scenarios (M5 follow-up #4) put a different terrain on the far room.
+    pub rooms: HashMap<RoomName, SimTerrain>,
     pub fleet: Vec<HaulAssignment>,
     pub tick_cap: u32,
 }
@@ -144,6 +149,7 @@ pub fn corpus() -> Vec<TuneScenario> {
         name: "open_lanes".into(),
         family: FAMILY_SYNTHETIC,
         terrain: SimTerrain::default(),
+        rooms: HashMap::new(),
         fleet: [20u8, 22, 24, 26]
             .iter()
             .map(|&y| hauler(pos_in("W1N1", 10, y), pos_in("W1N1", 20, y)))
@@ -162,6 +168,7 @@ pub fn corpus() -> Vec<TuneScenario> {
         name: "pinch".into(),
         family: FAMILY_SYNTHETIC,
         terrain: pinch,
+        rooms: HashMap::new(),
         fleet: (0..4).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W1N1", 20, 25))).collect(),
         tick_cap: 2_000,
     });
@@ -187,6 +194,7 @@ pub fn corpus() -> Vec<TuneScenario> {
         name: "pinch_hetero".into(),
         family: FAMILY_SYNTHETIC,
         terrain: pinch_hetero,
+        rooms: HashMap::new(),
         fleet: std::iter::once(HaulAssignment {
             body: big_hauler(),
             q: 800,
@@ -204,6 +212,7 @@ pub fn corpus() -> Vec<TuneScenario> {
         name: "cross_traffic".into(),
         family: FAMILY_SYNTHETIC,
         terrain: SimTerrain::default(),
+        rooms: HashMap::new(),
         fleet: vec![
             hauler(pos_in("W1N1", 15, 25), pos_in("W1N1", 35, 25)),
             hauler(pos_in("W1N1", 16, 25), pos_in("W1N1", 35, 25)),
@@ -227,6 +236,7 @@ pub fn corpus() -> Vec<TuneScenario> {
         name: "swamp_road".into(),
         family: FAMILY_SYNTHETIC,
         terrain: swamp_road,
+        rooms: HashMap::new(),
         fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W1N1", 20, 25))).collect(),
         tick_cap: 1_000,
     });
@@ -243,6 +253,7 @@ pub fn corpus() -> Vec<TuneScenario> {
             name: format!("base:{}", layout.room),
             family: FAMILY_REAL,
             terrain,
+            rooms: HashMap::new(),
             fleet,
             tick_cap: 2_500,
         });
@@ -252,14 +263,14 @@ pub fn corpus() -> Vec<TuneScenario> {
 
 /// The **FULL** tuning corpus (`TUNE_FULL_CORPUS=1` on the staged sweep; the checked-in fast tests
 /// keep [`corpus`] so the suite stays sub-second): [`corpus`] + ALL remaining captured real
-/// layouts (13 rooms total — every `captured_layouts()` entry) + two multi-room border-route
+/// layouts (13 rooms total — every `captured_layouts()` entry) + three multi-room border-route
 /// scenarios, the C-family axis the fast corpus lacks. Cross-room assignments are priced by the
 /// SOLO baseline ([`crate::haul::t_star_rtt_solo`] — η = pure contention loss; the single-room
-/// oracle cannot serve there), so their samples pool into the same `H`. Multi-room worlds here
-/// share ONE `SimTerrain` for every room (mirrored rooms — `MovementState.rooms` stays empty);
-/// the cost source is per-room-aware now ([`crate::cost::WorldCostSource`] snapshots
-/// `MovementState::rooms` + room-keys creep occupancy), so heterogeneous border scenarios only
-/// wait on the haul driver populating `rooms` (owned elsewhere).
+/// oracle cannot serve there), so their samples pool into the same `H`. The first two border
+/// scenarios share ONE `SimTerrain` for every room (mirrored rooms); `border_hetero` gives the
+/// far room a genuinely DIFFERENT terrain via [`TuneScenario::rooms`] (M5 follow-up #4 — the haul
+/// driver populates `MovementState.rooms` and the room-aware [`crate::cost::WorldCostSource`]
+/// prices each room from the same overrides).
 pub fn corpus_full() -> Vec<TuneScenario> {
     let mut scenarios = corpus();
 
@@ -277,6 +288,7 @@ pub fn corpus_full() -> Vec<TuneScenario> {
             name: format!("base:{}", layout.room),
             family: FAMILY_REAL,
             terrain,
+            rooms: HashMap::new(),
             fleet,
             tick_cap: 2_500,
         });
@@ -298,6 +310,7 @@ pub fn corpus_full() -> Vec<TuneScenario> {
         name: "border_plain".into(),
         family: FAMILY_BORDER,
         terrain: SimTerrain::default(),
+        rooms: HashMap::new(),
         fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W2N1", 40, 25))).collect(),
         tick_cap: 800,
     });
@@ -320,6 +333,33 @@ pub fn corpus_full() -> Vec<TuneScenario> {
         name: "border_swamp_road".into(),
         family: FAMILY_BORDER,
         terrain: swamp_corridor,
+        rooms: HashMap::new(),
+        fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W2N1", 40, 25))).collect(),
+        tick_cap: 2_000,
+    });
+
+    // HETEROGENEOUS border route (M5 follow-up #4 — the first scenario whose two rooms genuinely
+    // DIFFER): W1N1 stays open plain, W2N1 is overridden to all-swamp with a single road corridor
+    // at y=25. The optimal route changes character AT the border (plain free-lane → committed
+    // 1-wide road), off-road passing costs real fatigue only on the FAR side, and any mirrored-
+    // rooms regression (the pathfinder pricing W2N1 as plain, or the mover walking W2N1 as plain)
+    // shows up as an η/completion break here and nowhere else. Priced by the solo-T* baseline
+    // like every border scenario (the room-blind oracle cannot serve; §D5.4 decision #10).
+    let mut far_swamp_road = SimTerrain::default();
+    for x in 0..=49u8 {
+        for y in 0..=49u8 {
+            if y != 25 {
+                far_swamp_road.swamps.insert((x, y));
+            }
+        }
+        far_swamp_road.roads.insert((x, 25));
+    }
+    let w2n1: RoomName = "W2N1".parse().unwrap();
+    scenarios.push(TuneScenario {
+        name: "border_hetero".into(),
+        family: FAMILY_BORDER,
+        terrain: SimTerrain::default(),
+        rooms: [(w2n1, far_swamp_road)].into_iter().collect(),
         fleet: (0..2).map(|_| hauler(pos_in("W1N1", 10, 25), pos_in("W2N1", 40, 25))).collect(),
         tick_cap: 2_000,
     });
@@ -345,6 +385,32 @@ pub fn evaluate_config_opts(
     corpus: &[TuneScenario],
     seed: u32,
 ) -> TuneScore {
+    let outcomes = corpus_outcomes(config, opts, corpus, seed);
+    score_outcomes(corpus, &outcomes, seed)
+}
+
+/// Run every corpus scenario once, returning the per-scenario [`HaulOutcome`]s in corpus order —
+/// the detailed view [`score_outcomes`] aggregates and the corpus CLI (`bin/rover_bench`) prints
+/// per-scenario. Split from the scorer so a report never runs the corpus twice.
+pub fn corpus_outcomes(
+    config: &MoverConfig,
+    opts: &FleetOpts,
+    corpus: &[TuneScenario],
+    seed: u32,
+) -> Vec<HaulOutcome> {
+    corpus
+        .iter()
+        .map(|s| {
+            run_haul_fleet_world(&s.terrain, &s.rooms, &s.fleet, s.tick_cap, seed, config, opts)
+                .unwrap_or_else(|| panic!("corpus scenario `{}` must be oracle-solvable", s.name))
+        })
+        .collect()
+}
+
+/// Aggregate per-scenario outcomes (from [`corpus_outcomes`], parallel to `corpus`) into one
+/// [`TuneScore`] — the pooled + per-family Summaries and the summed audits/gates.
+pub fn score_outcomes(corpus: &[TuneScenario], outcomes: &[HaulOutcome], seed: u32) -> TuneScore {
+    assert_eq!(corpus.len(), outcomes.len(), "outcomes must be parallel to the corpus");
     let mut samples: Vec<(f64, f64)> = Vec::new();
     let mut family_samples: BTreeMap<&'static str, Vec<(f64, f64)>> = BTreeMap::new();
     let mut completed = 0u32;
@@ -355,9 +421,7 @@ pub fn evaluate_config_opts(
     let mut intents = 0u32;
     let mut ticks = 0u32;
 
-    for s in corpus {
-        let out = run_haul_fleet_opts(&s.terrain, &s.fleet, s.tick_cap, seed, config, opts)
-            .unwrap_or_else(|| panic!("corpus scenario `{}` must be oracle-solvable", s.name));
+    for (s, out) in corpus.iter().zip(outcomes) {
         samples.extend_from_slice(&out.samples);
         family_samples.entry(s.family).or_default().extend_from_slice(&out.samples);
         completed += out.completed_trips;
@@ -459,11 +523,14 @@ mod tests {
     /// H=0.8840 at widening (registration OFF, rover `e80b1dd`) → 0.9196 under the
     /// coordination-v2 stack (`register_idle_creeps` ON + denial-as-stuck + shoveable idles:
     /// every parked/failed-intent class dropped to literal 0 and the formerly-burned ticks became
-    /// throughput) → **0.9626 CI95=[0.9518,0.9729], completion 1.000, parked 0, 1519 ticks**
-    /// under the final shipped default stack (+ banked per-request haul ladder(8) + value triage,
-    /// the two [`FleetOpts`] defaults; corpus also gained `pinch_hetero`). The floor below is the
-    /// current measurement minus CI-scale slack for corpus evolution — a regression through it
-    /// means the corpus lost real value-weighted efficiency, not noise.
+    /// throughput) → 0.9626 CI95=[0.9518,0.9729], 1519 ticks under the final shipped default
+    /// stack (+ banked per-request haul ladder(8) + value triage, the two [`FleetOpts`] defaults;
+    /// corpus also gained `pinch_hetero`) → **0.9625 CI95=[0.9516,0.9725], completion 1.000,
+    /// parked 0, 1599 ticks** with the heterogeneous border scenario added (M5 follow-up #4:
+    /// corpus 19→20, `border_hetero` — per-family border 0.9625 n=12 / real 0.9654 n=156 /
+    /// synthetic 0.9273 n=36). The floors below are the current measurements minus CI-scale
+    /// slack for corpus evolution — a regression through one means the corpus lost real
+    /// value-weighted efficiency, not noise.
     #[test]
     fn default_config_holds_gates_on_the_full_corpus() {
         let score = evaluate_config(&MoverConfig::default(), &corpus_full(), 1);
@@ -483,9 +550,30 @@ mod tests {
         );
         assert!(
             score.h > 0.94,
-            "full-corpus pooled objective under the shipped default stack (measured 0.9626), got {}",
+            "full-corpus pooled objective under the shipped default stack (measured 0.9625), got {}",
             score.h
         );
+        // PER-FAMILY RATCHET FLOORS (M5-rest item 3; §D5.4 decision (11) made enforceable):
+        // each floor = the 2026-07-01 default-stack measurement minus 0.03 slack (≈ the family
+        // CI half-widths — the small families' bootstrap CIs are ±0.03-0.04). These are RATCHETS,
+        // NOT TARGETS: they exist so a config/rover change cannot buy pooled H by taxing one
+        // family (the pooled floor above would launder that); they ratchet UP as baselines move,
+        // never down without a named mechanism (the no-silent-gates rule). A new scenario that
+        // legitimately shifts a family's mix re-pins its floor in the same commit, mechanism-
+        // commented (see the baseline history above for the format).
+        let floors = [
+            (FAMILY_BORDER, 0.9325),    // measured 0.9625 (n=12, CI [0.9266, 0.9956])
+            (FAMILY_REAL, 0.9354),      // measured 0.9654 (n=156, CI [0.9532, 0.9761])
+            (FAMILY_SYNTHETIC, 0.8973), // measured 0.9273 (n=36, CI [0.8689, 0.9640])
+        ];
+        for (family, floor) in floors {
+            let h = score.per_family[family].weighted_mean;
+            assert!(
+                h > floor,
+                "per-family ratchet: {family} H {h:.4} fell through its floor {floor} \
+                 (a family-local regression the pooled floor would launder)"
+            );
+        }
     }
 
     /// Same config + corpus + seed ⇒ byte-identical score (the param_sweep determinism pin) —
@@ -552,7 +640,7 @@ mod tests {
             .into_iter()
             .filter(|s| s.name.starts_with("border_"))
             .collect();
-        assert_eq!(border.len(), 2, "both border scenarios present in the full corpus");
+        assert_eq!(border.len(), 3, "all three border scenarios present in the full corpus");
         let a = evaluate_config(&MoverConfig::default(), &border, 7);
         let b = evaluate_config(&MoverConfig::default(), &border, 7);
         assert_eq!(a.ranked_key(), b.ranked_key());

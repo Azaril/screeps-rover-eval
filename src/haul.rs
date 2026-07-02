@@ -17,13 +17,14 @@ use crate::oracle::optimal_path;
 use crate::stats::Summary;
 use crate::traverse::{pos_in, traverse_cycle};
 use crate::value::{quantize_w, Role};
-use screeps::Position;
+use screeps::{Position, RoomName};
 use screeps_rover::StuckThresholds;
 use screeps_sim_core::resolve_movement;
 use screeps_sim_core::{
     resolve_moves_via_system_with, MoveIntents, MovementState, MoverConfig, SimBody, SimCreep,
     SimMoveCache, SimMoveRequest, SimTerrain,
 };
+use std::collections::HashMap;
 
 /// Arrival range at both endpoints (1 = adjacent, like a real `transfer`/`withdraw`).
 const ENDPOINT_RANGE: u32 = 1;
@@ -165,8 +166,30 @@ pub fn t_star_rtt_solo_opts(
     config: &MoverConfig,
     opts: &FleetOpts,
 ) -> Option<u32> {
+    t_star_rtt_solo_world(terrain, &HashMap::new(), a, config, opts)
+}
+
+/// [`t_star_rtt_solo_opts`] over a HETEROGENEOUS multi-room world (`rooms` = per-room terrain
+/// overrides, [`screeps_sim_core::MovementState::rooms`] semantics: absent room ⇒ the default
+/// `terrain`). The baseline run carries the same rooms as the fleet run it prices — a cross-room
+/// η must measure contention, never a terrain mismatch between baseline and fleet.
+pub fn t_star_rtt_solo_world(
+    terrain: &SimTerrain,
+    rooms: &HashMap<RoomName, SimTerrain>,
+    a: &HaulAssignment,
+    config: &MoverConfig,
+    opts: &FleetOpts,
+) -> Option<u32> {
     let solo = HaulAssignment { trips: 1, ..a.clone() };
-    let sim = simulate_fleet(terrain, std::slice::from_ref(&solo), SOLO_TICK_CAP, config, opts, &[None]);
+    let sim = simulate_fleet(
+        terrain,
+        rooms,
+        std::slice::from_ref(&solo),
+        SOLO_TICK_CAP,
+        config,
+        opts,
+        &[None],
+    );
     if sim.deadlocked {
         return None;
     }
@@ -217,7 +240,8 @@ pub fn run_haul_fleet_with(
 }
 
 /// [`run_haul_fleet_with`] under explicit [`FleetOpts`] — the A/B surface for the per-request
-/// knobs (haul-lane stuck ladder, §D5.4 value triage).
+/// knobs (haul-lane stuck ladder, §D5.4 value triage). Single-terrain (mirrored rooms);
+/// heterogeneous multi-room worlds go through [`run_haul_fleet_world`].
 pub fn run_haul_fleet_opts(
     terrain: &SimTerrain,
     fleet: &[HaulAssignment],
@@ -226,18 +250,37 @@ pub fn run_haul_fleet_opts(
     config: &MoverConfig,
     opts: &FleetOpts,
 ) -> Option<HaulOutcome> {
+    run_haul_fleet_world(terrain, &HashMap::new(), fleet, tick_cap, seed, config, opts)
+}
+
+/// [`run_haul_fleet_opts`] over a HETEROGENEOUS multi-room world (ADR 0033 M5 follow-up #4):
+/// `rooms` holds per-room [`SimTerrain`] overrides with [`MovementState::rooms`] semantics — a
+/// room absent there is served the default `terrain` (mirrored), so `&HashMap::new()` reproduces
+/// the single-terrain entry points byte-exactly. The room-aware [`WorldCostSource`] prices each
+/// room from the same overrides, so mover, engine, and pathfinder agree per room by construction.
+pub fn run_haul_fleet_world(
+    terrain: &SimTerrain,
+    rooms: &HashMap<RoomName, SimTerrain>,
+    fleet: &[HaulAssignment],
+    tick_cap: u32,
+    seed: u32,
+    config: &MoverConfig,
+    opts: &FleetOpts,
+) -> Option<HaulOutcome> {
     let n = fleet.len();
-    // T* per assignment: same-room ⇒ the fatigue-exact ORACLE round trip (strict — η also prices
-    // route quality); cross-room ⇒ the SOLO baseline (rover's own uncontended round trip under the
-    // same config — η prices pure contention/coordination loss; see `t_star_rtt_solo`'s loud
-    // semantic note for why the oracle cannot serve here).
+    // T* per assignment: same-room ⇒ the fatigue-exact ORACLE round trip over THAT room's terrain
+    // (the override if one exists — `terrain_for` semantics; strict: η also prices route quality);
+    // cross-room ⇒ the SOLO baseline (rover's own uncontended round trip under the same config +
+    // the same rooms — η prices pure contention/coordination loss; see `t_star_rtt_solo`'s loud
+    // semantic note for why the single-room oracle cannot serve here — this holds for
+    // heterogeneous borders too, §D5.4 open decision #10).
     let t_stars: Vec<u32> = fleet
         .iter()
         .map(|a| {
             if a.source.room_name() == a.sink.room_name() {
-                t_star_rtt(terrain, a)
+                t_star_rtt(rooms.get(&a.source.room_name()).unwrap_or(terrain), a)
             } else {
-                t_star_rtt_solo_opts(terrain, a, config, opts)
+                t_star_rtt_solo_world(terrain, rooms, a, config, opts)
             }
         })
         .collect::<Option<Vec<_>>>()?;
@@ -255,7 +298,7 @@ pub fn run_haul_fleet_opts(
         vec![None; n]
     };
 
-    let sim = simulate_fleet(terrain, fleet, tick_cap, config, opts, &w_bids);
+    let sim = simulate_fleet(terrain, rooms, fleet, tick_cap, config, opts, &w_bids);
 
     // Samples: one per EXPECTED trip — completed trips score T*/T, never-completed trips score 0
     // (the catastrophic tail stays visible in the distribution, per the objective design).
@@ -284,13 +327,15 @@ pub fn run_haul_fleet_opts(
 }
 
 /// Drive the fleet through the real rover `MovementSystem` tick loop (no scoring). Multi-room
-/// worlds: `MovementState.rooms` is left EMPTY, so `terrain` serves every room a route touches
-/// (mirrored rooms — the kernel's `terrain_for` fallback). That matches [`WorldCostSource`], which
-/// answers the same matrix for any room; per-room terrain needs a `cost.rs` extension first
-/// (owned elsewhere — until then multi-room scenarios must share one terrain shape).
+/// worlds: `rooms` populates `MovementState.rooms` (per-room terrain overrides; an absent room is
+/// served the default `terrain` — the kernel's `terrain_for` fallback, i.e. mirrored). The
+/// room-aware [`WorldCostSource`] snapshots the same overrides each tick, so the pathfinder
+/// prices exactly what the mover walks, per room (ADR 0033 M5 follow-up #4 — before this the
+/// field was left empty and every border scenario shared ONE mirrored terrain by construction).
 /// `w_bids[i]` = assignment i's quantized value bid (`None` = enum anchor), indexed like `fleet`.
 fn simulate_fleet(
     terrain: &SimTerrain,
+    rooms: &HashMap<RoomName, SimTerrain>,
     fleet: &[HaulAssignment],
     tick_cap: u32,
     config: &MoverConfig,
@@ -300,6 +345,7 @@ fn simulate_fleet(
     let n = fleet.len();
     let mut world = MovementState {
         terrain: terrain.clone(),
+        rooms: rooms.clone(),
         creeps: fleet
             .iter()
             .enumerate()
@@ -557,6 +603,93 @@ mod tests {
         assert_eq!(out.audit.failed_coordination, 0, "no unexplained rejections at the border");
         let h = out.summary.weighted_mean;
         assert!(h > 0.0 && h <= 1.0, "solo-baselined H stays in (0, 1]: {h}");
+    }
+
+    /// HETEROGENEOUS multi-room well-posedness (ADR 0033 M5 follow-up #4), two gates:
+    ///
+    /// **(1) The override PRICES** — W2N1 overridden to ALL-SWAMP makes the balanced hauler's
+    /// loaded W2N1 half cost 5 ticks/step (accrual 2·10 = 20 vs regen 2·MOVE = 4) while the W1N1
+    /// half stays 1 tick/step, so the heterogeneous SOLO baseline must be strictly longer than
+    /// the mirrored-plain one (a mirrored-rooms regression — pathfinder or mover serving W2N1 the
+    /// default terrain — collapses them equal). Solo on purpose: one creep, no contention, so
+    /// this isolates the room-override plumbing.
+    ///
+    /// **(2) The contended fleet holds the hard gates** on the corpus's heterogeneous shape
+    /// (plain W1N1 → all-swamp-with-road-corridor W2N1, `corpus_full`'s `border_hetero`): all
+    /// trips complete, no deadlock, `failed_coordination == 0`, and η ∈ (0, 1] against the SOLO
+    /// baseline — cross-room T* stays solo-baselined even heterogeneously (the room-blind oracle
+    /// cannot price a border route; §D5.4 open decision #10, `t_star_rtt_solo`'s loud note).
+    ///
+    /// **Two PRE-EXISTING failed-intent classes probed 2026-07-01 (mirrored terrain reproduces
+    /// both ⇒ neither is a room-override artifact), recorded as open rover findings:**
+    /// (a) *border-wide `failed_wall`* — contended cross-room routes make rover issue moves whose
+    /// step falls OFF the 0..49 grid (a creep standing ON an exit tile issued outward — the
+    /// edge-relocation seam, the `aaac0f7` thrash class): mirrored PLAIN border 3 of 155 intents,
+    /// heterogeneous corridor 4 of 150, mirrored corridor 0 of 140. Never visible before because
+    /// no border gate/report read `failed_wall`. Pinned BOUNDED below, not `== 0`.
+    /// (b) *roadless all-swamp `failed_coordination`* — heavy-fatigue contention (loaded =
+    /// 5 ticks/step) adds unexplained rejections: mirrored all-swamp 6 coordination + 4 wall of
+    /// 156, heterogeneous 4 + 3 of 154 (suspect: vacate-chains granted through fatigued creeps).
+    /// The roadless variant is therefore deliberately NOT in this gate; when both are root-caused
+    /// and fixed, tighten the wall pin to `== 0` and add the roadless variant.
+    #[test]
+    fn heterogeneous_border_rooms_price_and_complete() {
+        let plain = SimTerrain::default();
+        let mut swamp = SimTerrain::default();
+        for x in 0..=49u8 {
+            for y in 0..=49u8 {
+                swamp.swamps.insert((x, y));
+            }
+        }
+        let room_b: RoomName = "W2N1".parse().unwrap();
+        let rooms: HashMap<RoomName, SimTerrain> = [(room_b, swamp)].into_iter().collect();
+
+        let a = HaulAssignment {
+            body: balanced_hauler(),
+            q: 100,
+            source: pos_in_room("W1N1", 10, 25),
+            sink: pos_in_room("W2N1", 40, 25),
+            trips: 2,
+        };
+        let (config, opts) = (MoverConfig::default(), FleetOpts::default());
+        let mirrored = t_star_rtt_solo_opts(&plain, &a, &config, &opts)
+            .expect("the mirrored-plain border route is solo-solvable");
+        let hetero = t_star_rtt_solo_world(&plain, &rooms, &a, &config, &opts)
+            .expect("the heterogeneous border route is solo-solvable");
+        assert!(
+            hetero > mirrored,
+            "the W2N1 swamp override must lengthen the solo round trip ({hetero} vs mirrored {mirrored})"
+        );
+
+        // Gate (2): the corpus shape — W2N1 all-swamp EXCEPT the road corridor at y=25.
+        let mut far_swamp_road = SimTerrain::default();
+        for x in 0..=49u8 {
+            for y in 0..=49u8 {
+                if y != 25 {
+                    far_swamp_road.swamps.insert((x, y));
+                }
+            }
+            far_swamp_road.roads.insert((x, 25));
+        }
+        let rooms_corridor: HashMap<RoomName, SimTerrain> =
+            [(room_b, far_swamp_road)].into_iter().collect();
+        let fleet = vec![a.clone(), a];
+        let out = run_haul_fleet_world(&plain, &rooms_corridor, &fleet, 2_000, 1, &config, &opts)
+            .expect("solvable");
+        assert_eq!(out.completed_trips, out.expected_trips, "all heterogeneous border trips complete");
+        assert!(!out.deadlocked);
+        assert_eq!(out.audit.failed_coordination, 0, "no unexplained rejections across the border");
+        // The pre-existing border-wide exit-tile class (finding (a) above): pinned at its probed
+        // level as a REGRESSION bound, not a target — mirrored plain borders sit at 3, this shape
+        // at 4. Tighten to == 0 when the edge-relocation finding is fixed at the source.
+        assert!(
+            out.audit.failed_wall <= 4,
+            "border exit-tile failed-move regression: {} of {} intents (probed baseline 4)",
+            out.audit.failed_wall,
+            out.audit.intents_issued
+        );
+        let h = out.summary.weighted_mean;
+        assert!(h > 0.0 && h <= 1.0, "solo-baselined heterogeneous H stays in (0, 1]: {h}");
     }
 
     #[test]
