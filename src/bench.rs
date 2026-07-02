@@ -446,7 +446,8 @@ mod tests {
     /// congestion-blowup class: a super-linear lanes slope means creep count alone (not
     /// contention) inflates per-creep search work. LOOSE bound: slope ≤ 1.5 (measured N^0.79 on
     /// 2026-07-01 — mildly SUB-linear: larger fleets finish in similar tick counts, so the
-    /// per-tick average amortizes the fixed search charges).
+    /// per-tick average amortizes the fixed search charges; re-measured N^0.75 later the same
+    /// day under the dense-crowd fix set — reserve + windowed damper + freed-tiles chains).
     #[test]
     #[ignore]
     fn scaling_ops_vs_parallel_creeps() {
@@ -473,24 +474,46 @@ mod tests {
     /// §D5.3 scaling curve 2 (`#[ignore]`): ops/tick vs N creeps through ONE shared gap — the
     /// congestion case. Serialization + stuck-escalation repaths make some super-linearity
     /// STRUCTURAL here (each blocked creep repaths as the queue drains), so this curve is
-    /// primarily a printed regression record (measured N^1.35 over 1..32, 2026-07-01); the bound
-    /// is a very loose backstop against the runaway class (resolver recursion / repath storms),
-    /// not a linearity gate.
+    /// primarily a printed regression record; the bound is a very loose backstop against the
+    /// runaway class (resolver recursion / repath storms), not a linearity gate.
     ///
-    /// **CURVE CAPPED AT N=32 — the dense-crowd breakdown finding (2026-07-01).** Probed at
-    /// 1500-tick caps via `run_crowd`: N=32 clears in 76 ticks gates-green; N=40 clears but
-    /// breaks the standing `failed_coordination == 0` gate for the first time (43 of 2111
-    /// intents); N≥48 partially LIVELOCKS — 42/48, 37/56, 38/64 arrived, 15k–34k engine-rejected
-    /// intents, and the ops bench shows the pathfinding budget SATURATED at the full 20 000
-    /// ops/tick for 8000+ ticks at N=64 (the live "CPU pathfinding death-spiral" signature;
-    /// deadlock detector silent — the crowd keeps dancing). That is the §D6 D6 dense-field gate
-    /// class (`deadlock==0, livelock==0`) failing in the resolver, recorded as an open rover
-    /// finding with its own follow-up task; when fixed, restore `64` (and add 40/48/56) to `NS`
-    /// below and re-pin the slope.
+    /// **The dense-crowd breakdown (found 2026-07-01, capped this curve at N=32; ROOT-CAUSED +
+    /// FIXED the same day — curve restored to N=64).** As found: N=40 broke the standing
+    /// `failed_coordination == 0` gate (43 of 2111 intents); N≥48 partially LIVELOCKED (42/48,
+    /// 37/56, 38/64 arrived; 15k–34k engine-rejected intents; the ops pool SATURATED at the full
+    /// 20 000 ops/tick for 8000+ ticks at N=64 — the live "CPU pathfinding death-spiral"
+    /// signature, deadlock detector silent). THREE interlocking mechanisms, all fixed in rover:
+    /// (1) *stuck-repath storm* — `needs_repath` was a LEVEL, so every immobile-≥tier-1 creep
+    /// re-searched EVERY tick; a dense stuck crowd drained the whole per-tick ops pool
+    /// indefinitely → fixed by the FIRST-PATH POOL RESERVE (repaths are optional work and may
+    /// not consume the last fifth of the pool — `needs_path` searches always find real budget)
+    /// plus the per-episode storm damper (`StuckState::should_stuck_repath_with`: free cadence
+    /// inside the designed escalation window, `ticks_immobile ≤ report_failure`, where tiers
+    /// still flip and combat coordination needs the fast recovery — the drain-soak bed
+    /// adjudicated that; exponential spacing past tier 4, where the ladder has nothing new and a
+    /// long jam's searches are pure waste — the ADR 0004 repath-storm class, IBEX-016's
+    /// repurposed `repath_count`);
+    /// (2) *pathless starvation* — mid-order creeps got dreg ops allowances, their `needs_path`
+    /// searches failed incomplete forever, and a pathless creep was ALSO invisible to the
+    /// resolver (`process()` Pass 1's `Err` arm inserted no occupancy entry — the third instance
+    /// of the stationary-occupant hole) → the wedge nuclei other creeps were granted THROUGH
+    /// (the coordination flood) → fixed by the `stationary_occupant` entry on path errors + the
+    /// reserve clearing the starvation itself;
+    /// (3) *double-booked shove chains* — `try_shove`'s frame-entry `firmly_occupied` snapshot
+    /// goes stale across chain recursion, so a deep chain member could land on a tile the chain
+    /// had already promised away (its own vacated tiles included), double-booking the move-set →
+    /// fixed at the source by the `freed_tiles` chain stack (no member may land on any tile the
+    /// active chain is vacating — the chain picks another landing and SUCCEEDS) with
+    /// post-recursion re-checks kept as defence-in-depth (resolver.rs).
+    /// Post-fix: every probed N (40/48/56/64/96) fully arrives with the audit ALL-ZERO through
+    /// 64; saturation only during the cold-start path-distribution window. The checked-in gate
+    /// is `dense_pinch_crowd_holds_all_gates` (crowd.rs); this curve re-pins the slope over the
+    /// restored range: **N^1.244 over 1..64** (2026-07-01, the final fix set — vs the pre-fix
+    /// N^1.35 that was only measurable to N=32).
     #[test]
     #[ignore]
     fn scaling_ops_at_the_shared_pinch() {
-        const NS: &[usize] = &[1, 2, 4, 8, 16, 32];
+        const NS: &[usize] = &[1, 2, 4, 8, 16, 32, 40, 48, 56, 64];
         let config = MoverConfig::default();
         let mut points = Vec::new();
         for &n in NS {

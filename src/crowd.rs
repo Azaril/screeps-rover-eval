@@ -399,6 +399,27 @@ mod tests {
         );
     }
 
+    /// The DENSE-CROWD gate (the N≥40 pinch-breakdown chip, fixed 2026-07-01): 48 creeps forced
+    /// through one wall gap into a packed per-creep goal block — the shape that livelocked
+    /// (29/48 arrived at a 2000-tick cap, 17k+ unexplained rejections, the pathfinding ops pool
+    /// saturated indefinitely) before the three rover fixes landed: the stuck-repath storm
+    /// damper, stationary occupancy for path-error creeps, and the post-recursion double-booking
+    /// re-checks in the shove chains (the full mechanism record lives on
+    /// [`crate::bench`]'s `scaling_ops_at_the_shared_pinch`). Gates: everyone arrives, no
+    /// deadlock, and the failed-move sentinel is ZERO across all classes.
+    #[test]
+    fn dense_pinch_crowd_holds_all_gates() {
+        let (terrain, creeps) = crate::bench::shared_pinch(48);
+        let r = run_crowd(&terrain, &creeps, 400);
+        assert!(r.all_arrived, "all 48 creeps must clear the pinch; arrivals={:?}", r.arrivals);
+        assert!(!r.deadlocked, "dense crowds serialise, never deadlock");
+        assert_eq!(
+            r.audit.failed_moves, 0,
+            "the dense-crowd move-set must be fully self-consistent: {:?}",
+            r.audit
+        );
+    }
+
     /// The nastiest coordination pattern: 8 creeps on a ring, each targeting the diametrically
     /// opposite point, so every shortest path crosses the same centre tiles at the same time. rover
     /// must still emit only self-consistent move-sets — **zero failed moves** ("intent spent, no
