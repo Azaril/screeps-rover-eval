@@ -601,6 +601,14 @@ mod tests {
         assert_eq!(out.completed_trips, out.expected_trips, "all border trips complete");
         assert!(!out.deadlocked);
         assert_eq!(out.audit.failed_coordination, 0, "no unexplained rejections at the border");
+        // This shape probed 3 `failed_wall` of 155 intents before the stationary-crosser fix
+        // (a bounced crosser issued the engine-dropped outward step each seam tick) — total
+        // failed moves gate ZERO since.
+        assert_eq!(
+            out.audit.failed_moves, 0,
+            "the contended border move-set is fully self-consistent: {:?}",
+            out.audit
+        );
         let h = out.summary.weighted_mean;
         assert!(h > 0.0 && h <= 1.0, "solo-baselined H stays in (0, 1]: {h}");
     }
@@ -620,18 +628,28 @@ mod tests {
     /// baseline — cross-room T* stays solo-baselined even heterogeneously (the room-blind oracle
     /// cannot price a border route; §D5.4 open decision #10, `t_star_rtt_solo`'s loud note).
     ///
-    /// **Two PRE-EXISTING failed-intent classes probed 2026-07-01 (mirrored terrain reproduces
-    /// both ⇒ neither is a room-override artifact), recorded as open rover findings:**
-    /// (a) *border-wide `failed_wall`* — contended cross-room routes make rover issue moves whose
-    /// step falls OFF the 0..49 grid (a creep standing ON an exit tile issued outward — the
-    /// edge-relocation seam, the `aaac0f7` thrash class): mirrored PLAIN border 3 of 155 intents,
-    /// heterogeneous corridor 4 of 150, mirrored corridor 0 of 140. Never visible before because
-    /// no border gate/report read `failed_wall`. Pinned BOUNDED below, not `== 0`.
-    /// (b) *roadless all-swamp `failed_coordination`* — heavy-fatigue contention (loaded =
-    /// 5 ticks/step) adds unexplained rejections: mirrored all-swamp 6 coordination + 4 wall of
-    /// 156, heterogeneous 4 + 3 of 154 (suspect: vacate-chains granted through fatigued creeps).
-    /// The roadless variant is therefore deliberately NOT in this gate; when both are root-caused
-    /// and fixed, tighten the wall pin to `== 0` and add the roadless variant.
+    /// **Two failed-intent classes this test surfaced 2026-07-01 (mirrored terrain reproduced
+    /// both ⇒ neither was a room-override artifact), ROOT-CAUSED + FIXED the same day at the
+    /// source (screeps-rover `movementsystem.rs` Pass 1, the `stationary_occupant` model) — the
+    /// pins below gate `== 0` since:**
+    /// (a) *border-wide `failed_wall`* (probed: mirrored plain 3 of 155, heterogeneous corridor
+    /// 4 of 150, mirrored corridor 0 of 140) — the unconditional end-of-tick edge relocation
+    /// (engine `creeps/tick.js`) bounces a contention-blocked crosser BACK onto the exit tile;
+    /// its next path step is then the adjacent room's mirror tile, which Pass 3 turned into an
+    /// outward `Direction` — an intent the engine drops at registration (`move.js:32`; the cross
+    /// IS the relocation, never a move — the `aaac0f7` thrash family, one wasted intent per
+    /// bounce). Fixed: a cross-room desired step becomes a stationary occupant — no intent, the
+    /// relocation crosses for free, and the seam tile stays resolver-visible while occupied.
+    /// (b) *roadless all-swamp `failed_coordination`* (probed: mirrored all-swamp 6 + 4 wall of
+    /// 156, heterogeneous 4 + 3 of 154) — a FATIGUED requested creep (loaded swamp leg =
+    /// 5 ticks/step) was dropped from Pass 1 entirely: no `ResolvedCreep` entry, and not in
+    /// `idle_creep_positions` either (it IS requested) — its tile was invisible to the
+    /// resolver's grant/avoidance/shove occupancy maps, so other creeps were planned straight
+    /// through it and the engine rejected every such intent (a fatigued creep occupies its tile
+    /// through the whole movement phase; `canMove` drops its own moves too). Fixed:
+    /// fatigued/spawning requested creeps become stationary, non-displaceable occupants.
+    /// The roadless contended variant graduated into the gate:
+    /// [`roadless_all_swamp_contended_border_wastes_no_intents`].
     #[test]
     fn heterogeneous_border_rooms_price_and_complete() {
         let plain = SimTerrain::default();
@@ -679,17 +697,76 @@ mod tests {
         assert_eq!(out.completed_trips, out.expected_trips, "all heterogeneous border trips complete");
         assert!(!out.deadlocked);
         assert_eq!(out.audit.failed_coordination, 0, "no unexplained rejections across the border");
-        // The pre-existing border-wide exit-tile class (finding (a) above): pinned at its probed
-        // level as a REGRESSION bound, not a target — mirrored plain borders sit at 3, this shape
-        // at 4. Tighten to == 0 when the edge-relocation finding is fixed at the source.
-        assert!(
-            out.audit.failed_wall <= 4,
-            "border exit-tile failed-move regression: {} of {} intents (probed baseline 4)",
+        // Finding (a) above, fixed at the source (stationary-crosser model): the border-wide
+        // exit-tile class gates ZERO — any outward intent from a seam tile is engine-dropped by
+        // construction, so one appearing again is a resolver↔engine divergence, not tolerable burn.
+        assert_eq!(
+            out.audit.failed_wall, 0,
+            "border exit-tile intents are gone at the source: {} of {} intents",
             out.audit.failed_wall,
             out.audit.intents_issued
         );
+        assert_eq!(
+            out.audit.failed_moves, 0,
+            "the issued cross-border move-set is fully self-consistent: {:?}",
+            out.audit
+        );
         let h = out.summary.weighted_mean;
         assert!(h > 0.0 && h <= 1.0, "solo-baselined heterogeneous H stays in (0, 1]: {h}");
+    }
+
+    /// The ROADLESS heavy-fatigue border variant — the shape that exposed the fatigued-occupancy
+    /// class (finding (b) of [`heterogeneous_border_rooms_price_and_complete`]'s doc): the same
+    /// contended cross-room route over ALL-SWAMP (loaded = 5 ticks/step, so creeps spend most
+    /// ticks fatigued in place while their mates' paths run through them), mirrored AND
+    /// heterogeneous. Deliberately excluded from the gate while the classes were open findings
+    /// (probed 2026-07-01: mirrored 6 coordination + 4 wall of 156, heterogeneous 4 + 3 of 154);
+    /// with both fixed at the source it gates `== 0` like every other contended scenario.
+    #[test]
+    fn roadless_all_swamp_contended_border_wastes_no_intents() {
+        let mut swamp = SimTerrain::default();
+        for x in 0..=49u8 {
+            for y in 0..=49u8 {
+                swamp.swamps.insert((x, y));
+            }
+        }
+        let plain = SimTerrain::default();
+        let room_b: RoomName = "W2N1".parse().unwrap();
+        let hetero_rooms: HashMap<RoomName, SimTerrain> =
+            [(room_b, swamp.clone())].into_iter().collect();
+        let (config, opts) = (MoverConfig::default(), FleetOpts::default());
+
+        let cases: [(&str, &SimTerrain, HashMap<RoomName, SimTerrain>); 2] = [
+            ("mirrored all-swamp", &swamp, HashMap::new()),
+            ("heterogeneous plain→swamp", &plain, hetero_rooms),
+        ];
+        for (name, terrain, rooms) in cases {
+            let fleet: Vec<HaulAssignment> = (0..2)
+                .map(|_| HaulAssignment {
+                    body: balanced_hauler(),
+                    q: 100,
+                    source: pos_in_room("W1N1", 10, 25),
+                    sink: pos_in_room("W2N1", 40, 25),
+                    trips: 2,
+                })
+                .collect();
+            let out = run_haul_fleet_world(terrain, &rooms, &fleet, 3_000, 1, &config, &opts)
+                .expect("solvable");
+            assert_eq!(
+                out.completed_trips, out.expected_trips,
+                "{name}: all heavy-fatigue border trips complete"
+            );
+            assert!(!out.deadlocked, "{name}: no deadlock");
+            assert_eq!(
+                out.audit.failed_moves, 0,
+                "{name}: heavy-fatigue contention must waste zero intents (probed at \
+                 6 coordination + 4 wall of 156 before the fatigued-occupancy and \
+                 stationary-crosser fixes): {:?}",
+                out.audit
+            );
+            let h = out.summary.weighted_mean;
+            assert!(h > 0.0 && h <= 1.0, "{name}: solo-baselined H stays in (0, 1]: {h}");
+        }
     }
 
     #[test]
