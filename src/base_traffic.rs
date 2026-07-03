@@ -30,6 +30,13 @@ pub struct PlannedStructure {
     pub kind: String,
     pub x: u8,
     pub y: u8,
+    /// The foreman plan's RCL schedule for this placement (`RoomItem::required_rcl`,
+    /// screeps-foreman/src/plan.rs:27) — the level at which the structure exists. `None` only for
+    /// items the planner left unresolved (foreman finalization defaults those to 1).
+    /// `#[serde(default)]` so the pre-extension committed cache still parses (ADR 0040 M1: the
+    /// economy sim realizes layouts "as of RCL R" from this field).
+    #[serde(default)]
+    pub required_rcl: Option<u8>,
 }
 
 /// A captured full base layout: real terrain (2500-char column-major encoding, ADR 0025a) + the

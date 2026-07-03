@@ -71,14 +71,20 @@ fn capture(fixture: &TerrainFixture) -> Result<CapturedLayout, String> {
         .structures
         .iter()
         .flat_map(|(location, items)| {
+            // Each RoomItem becomes its own PlannedStructure, so a Location carrying multiple
+            // RoomItems (e.g. rampart-over-structure) keeps each kind paired with ITS OWN
+            // `required_rcl` (screeps-foreman/src/plan.rs:27) — the ADR 0040 M1 capture extension.
             items.iter().map(|item| PlannedStructure {
                 kind: format!("{:?}", item.structure_type()).to_ascii_lowercase(),
                 x: location.x(),
                 y: location.y(),
+                required_rcl: item.required_rcl_opt(),
             })
         })
         .collect();
-    structures.sort_by(|a, b| (&a.kind, a.x, a.y).cmp(&(&b.kind, b.x, b.y)));
+    structures.sort_by(|a, b| {
+        (&a.kind, a.x, a.y, a.required_rcl).cmp(&(&b.kind, b.x, b.y, b.required_rcl))
+    });
     Ok(CapturedLayout {
         room: fixture.room.clone(),
         terrain: fixture.terrain.clone(),
