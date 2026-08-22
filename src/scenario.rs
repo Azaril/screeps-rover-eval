@@ -159,6 +159,41 @@ pub fn catalog() -> Vec<Scenario> {
     ]
 }
 
+/// A seeded REALISTIC room (ADR 0044): the shared cellular-automata cave generator
+/// ([`screeps_sim_core::terrain_gen`]) — clustered walls + swamp, forcing genuine detours (unlike
+/// the open/patch corpus). Endpoints are two CONNECTED interior tiles (via `connected_open`, never
+/// on an edge — that would relocate the creep), so the goal is always reachable through the cave.
+/// This stresses rover's route-optimality on hard terrain — the regime the operator flagged the
+/// trivial rooms never exercised.
+pub fn generate_realistic(seed: u32) -> Scenario {
+    use screeps_sim_core::terrain_gen::{connected_open, generate_terrain, Exits, TerrainGenParams};
+    let terrain = generate_terrain(seed, &TerrainGenParams { exits: Exits::horizontal(), ..Default::default() });
+    let region = connected_open(&terrain, (25, 25));
+    // The connected interior tile nearest a target (excluding edge tiles that would trigger the
+    // kernel's cross-room relocation).
+    let pick = |tx: i32| {
+        region
+            .iter()
+            .filter(|&&(x, y)| x >= 1 && x <= 48 && y >= 1 && y <= 48)
+            .min_by_key(|&&(x, y)| (x as i32 - tx).pow(2) + (y as i32 - 25).pow(2))
+            .copied()
+            .unwrap_or((25, 25))
+    };
+    let (fx, fy) = pick(6);
+    let (gx, gy) = pick(43);
+    Scenario {
+        name: "generated_realistic",
+        terrain,
+        spec: balanced(),
+        from: pos_in(room(), fx, fy),
+        goal: pos_in(room(), gx, gy),
+        range: 0,
+        // Loose bounds — realistic caves detour more; the point is rover stays NEAR-optimal.
+        max_r_fatigue: 1.15,
+        max_r_ticks: 1.5,
+    }
+}
+
 /// A seeded procedural room: scattered swamp patches + an optional road stripe (both passable, so the
 /// goal is always oracle-reachable — no walls), with a balanced creep crossing it. Loose gates: this
 /// tests that rover routes a random fatigue field near-optimally, not a specific layout.
@@ -221,6 +256,34 @@ mod tests {
                 r.failures, r.r_fatigue, r.r_ticks
             );
         }
+    }
+
+    /// ADR 0044: rover stays NEAR-OPTIMAL and never hits the ops cap on REALISTIC cave terrain over
+    /// a seed sweep — the deviation check for wiring the shared generator into the pathing sim. Prints
+    /// the worst ratios so re-tuning (thresholds / ops cap) is evidence-driven.
+    #[test]
+    fn realistic_rooms_stay_near_optimal() {
+        let (mut worst_fat, mut worst_tk, mut incomplete, mut unsolvable) = (0.0f64, 0.0f64, 0u32, 0u32);
+        for seed in 0..30u32 {
+            let s = generate_realistic(seed);
+            let r = validate(&s);
+            if !r.solvable {
+                unsolvable += 1;
+                continue;
+            }
+            match (r.r_fatigue, r.r_ticks) {
+                (Some(f), Some(t)) => {
+                    worst_fat = worst_fat.max(f);
+                    worst_tk = worst_tk.max(t);
+                }
+                _ => incomplete += 1,
+            }
+        }
+        eprintln!("realistic pathing over 30 seeds: worst R_fatigue={worst_fat:.4} worst R_ticks={worst_tk:.4} ops-cap/incomplete={incomplete} unsolvable={unsolvable}");
+        assert_eq!(unsolvable, 0, "generated realistic rooms must be solvable (endpoints are connected)");
+        assert_eq!(incomplete, 0, "rover hit the 20k ops cap on a single realistic room — raise the cap or the terrain is too dense");
+        assert!(worst_fat <= 1.15, "rover route-optimality degraded on caves: worst R_fatigue={worst_fat}");
+        assert!(worst_tk <= 1.5, "rover travel-time degraded on caves: worst R_ticks={worst_tk}");
     }
 
     #[test]
