@@ -598,6 +598,35 @@ mod tests {
         assert_eq!(family_report(&a), family_report(&b), "byte-identical family report");
     }
 
+    /// ADR 0033 §D7 — the fence PROMOTED CORPUS-WIDE (WS-4, 2026-08-23): same config + FULL corpus
+    /// (every captured real room, all synthetic + border scenarios) + seed ⇒ byte-identical
+    /// aggregate AND per-family scores, run-twice. The checked-in fast pin
+    /// (`evaluation_is_deterministic`) covers the fast subset every CI run; this is the whole-corpus
+    /// spread==0 gate — run it before shipping any rover/resolver change:
+    /// `cargo test --release -p screeps-rover-eval full_corpus_evaluation_is_deterministic -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn full_corpus_evaluation_is_deterministic() {
+        let corpus = corpus_full();
+        let a = evaluate_config(&MoverConfig::default(), &corpus, 7);
+        let b = evaluate_config(&MoverConfig::default(), &corpus, 7);
+        assert_eq!(a.ranked_key(), b.ranked_key());
+        assert_eq!(a.h.to_bits(), b.h.to_bits(), "bit-identical pooled H over the FULL corpus");
+        assert_eq!(a.intents_issued, b.intents_issued);
+        let fams: Vec<_> = a.per_family.keys().copied().collect();
+        assert_eq!(fams, b.per_family.keys().copied().collect::<Vec<_>>());
+        for f in fams {
+            assert_eq!(
+                a.per_family[f].weighted_mean.to_bits(),
+                b.per_family[f].weighted_mean.to_bits(),
+                "bit-identical per-family H ({f}) over the FULL corpus"
+            );
+            assert_eq!(a.per_family[f].n, b.per_family[f].n);
+        }
+        assert_eq!(family_report(&a), family_report(&b), "byte-identical full-corpus family report");
+        println!("[ADR0033 D7] full-corpus fence: spread==0 over {} scenarios (pooled H {:.4})", corpus.len(), a.h);
+    }
+
     /// Decision (11)'s partition invariant: every sample lands in exactly ONE family, so family
     /// sample counts sum to the corpus's expected trips and the pooled H is a convex combination
     /// of the family Hs (it can never leave their [min, max] envelope).
