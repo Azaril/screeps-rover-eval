@@ -174,7 +174,7 @@ pub fn generate_realistic(seed: u32) -> Scenario {
     let pick = |tx: i32| {
         region
             .iter()
-            .filter(|&&(x, y)| x >= 1 && x <= 48 && y >= 1 && y <= 48)
+            .filter(|&&(x, y)| (1..=48).contains(&x) && (1..=48).contains(&y))
             .min_by_key(|&&(x, y)| (x as i32 - tx).pow(2) + (y as i32 - 25).pow(2))
             .copied()
             .unwrap_or((25, 25))
